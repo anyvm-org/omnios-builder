@@ -65,5 +65,6 @@ jobs:
           omnios-${{ matrix.os }}.qcow2.zst*
           omnios-${{ matrix.os }}-id_rsa.pub
           omnios-${{ matrix.os }}-host.id_rsa
+          omnios-${{ matrix.os }}.xml
 
 
