@@ -23,10 +23,10 @@ jobs:
       - name: Using main branch
         run: |
           git switch main || (git fetch --all && git checkout -b main origin/main)
-          git clone https://github.com/vmactions/base-builder.git
+          git clone https://github.com/anyvm-org/base-builder.git
 
       - name: Sync generate.yml
-        uses: vmactions/render@v0.0.1
+        uses: anyvm-org/template-render@v0.0.2
         with:
           datafile: .github/data/datafile.ini
           files: |
