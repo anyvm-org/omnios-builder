@@ -1,11 +1,11 @@
 
 
-[![Build](https://github.com/vmactions/omnios-builder/actions/workflows/build.yml/badge.svg)](https://github.com/vmactions/omnios-builder/actions/workflows/build.yml)
+[![Build](https://github.com/anyvm-org/omnios-builder/actions/workflows/build.yml/badge.svg)](https://github.com/anyvm-org/omnios-builder/actions/workflows/build.yml)
 
 Latest: v0.0.8
 
 
-The image builder for [omnios-vm](https://github.com/vmactions/omnios-vm)
+The image builder for `omnios`
 
 
 How to use:
