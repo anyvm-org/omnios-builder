@@ -2,7 +2,7 @@
 
 [![Build](https://github.com/anyvm-org/omnios-builder/actions/workflows/build.yml/badge.svg)](https://github.com/anyvm-org/omnios-builder/actions/workflows/build.yml)
 
-Latest: v0.0.8
+Latest: v0.0.9
 
 
 The image builder for `omnios`
@@ -20,6 +20,6 @@ How to use:
 
     Just clone the repo. and run:
     ```bash
-    bash build.sh conf/omnios-r151054.conf
+    bash build.sh conf/omnios-r151056.conf
     ```
    
