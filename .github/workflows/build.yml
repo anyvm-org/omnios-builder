@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ["r151046", "r151048", "r151050", "r151052", "r151054"]
+        os: ["r151046", "r151048", "r151050", "r151052", "r151054", "r151056"]
     runs-on: ubuntu-24.04
     env:
       SEC_VBOX : ${{ vars.SEC_VBOX }}
