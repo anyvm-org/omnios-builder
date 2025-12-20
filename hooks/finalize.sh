@@ -7,4 +7,5 @@ passwd -d root
 rm -f /tmp/login.new
 
 
+rm -f /etc/resolv.conf
 
