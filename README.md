@@ -8,6 +8,26 @@ Latest: v2.0.4
 The image builder for `omnios`
 
 
+All the supported releases are here:
+
+
+
+| Release | x86_64  |
+|---------|---------|
+| r151056 |  ✅     |
+| r151054 |  ✅     |
+| r151052 |  ✅     |
+| r151050 |  ✅     |
+| r151048 |  ✅     |
+| r151046 |  ✅     |
+
+
+
+
+
+
+
+
 How to use:
 
 1. Use the [manual.yml](.github/workflows/manual.yml) to build manually.
