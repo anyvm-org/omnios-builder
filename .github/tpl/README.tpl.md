@@ -8,6 +8,12 @@ Latest: {{LATEST_TAG}}
 The image builder for `{{VM_OS_NAME}}`
 
 
+All the supported releases are here:
+
+{{RELEASE_TABLE}}
+
+
+
 How to use:
 
 1. Use the [manual.yml](.github/workflows/manual.yml) to build manually.
