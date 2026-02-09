@@ -18,11 +18,15 @@ customise aspects of the ZFS Root Pool | enter; enter;enter
 Omni | enter
 
 
-Is the above information OK | enter |  10
+
 
 
 #Please identify a location so that time zone rules can be set correctly
-Please select a continent |  enter
+Please select a continent |  enter  | 10
+
+
+Is the above information OK | enter |  10
+
 
 
 The following information has been given | enter
