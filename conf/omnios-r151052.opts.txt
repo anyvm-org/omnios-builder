@@ -18,7 +18,7 @@ customise aspects of the ZFS Root Pool | enter; enter;enter
 OmniOS | enter
 
 
-Is the above information OK | enter |  60
+Is the above information OK | enter | 10
 
 #Please identify a location so that time zone rules can be set correctly
 Please select a continent |  enter
