@@ -22,10 +22,10 @@ Omni | enter
 
 
 #Please identify a location so that time zone rules can be set correctly
-Please select a continent |  enter  | 10
+Please select a continent |  enter  
 
 
-Is the above information OK | enter |  10
+#Is the above information OK | enter |  10
 
 
 
