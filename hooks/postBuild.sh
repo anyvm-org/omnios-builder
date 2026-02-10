@@ -27,3 +27,14 @@ rm -f auto.txt
 automount -v
 svcadm restart autofs
 
+
+rm -f /etc/resolv.conf
+echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+echo "nameserver 9.9.9.9" >> /etc/resolv.conf
+
+
+sed -i 's/^PARAM_REQUEST_LIST=\(.*\),6\(,.*\)$/PARAM_REQUEST_LIST=\1\2/; s/^PARAM_REQUEST_LIST=6,\(.*\)$/PARAM_REQUEST_LIST=\1/; s/^PARAM_REQUEST_LIST=\(.*\),6$/PARAM_REQUEST_LIST=\1/' /etc/default/dhcpagent
+
+sed -i 's/^PARAM_IGNORE_LIST=$/PARAM_IGNORE_LIST=6/' /etc/default/dhcpagent
+

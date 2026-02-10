@@ -9,7 +9,6 @@ rm -f /tmp/login.new
 
 cat /etc/resolv.conf
 
-rm -f /etc/resolv.conf
 
 
 
