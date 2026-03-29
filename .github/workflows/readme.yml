@@ -40,16 +40,20 @@ jobs:
           echo "LATEST_CONF=$latest" >> $GITHUB_ENV
 
       - name: Update the readme.md
-        uses: anyvm-org/template-render@v0.0.2
+        uses: anyvm-org/template-render@v0.0.4
         with:
           datafile: .github/data/datafile.ini
           files: |
             .github/tpl/README.tpl.md : README.md
 
-      - uses: EndBug/add-and-commit@v9
-        with:
-          message: "Update version to ${{ steps.get-latest-release.outputs.tag_name }}"
-          pull: '--rebase --autostash '
-          add: |
-            README.md
+
+      - name: Commit and push changes
+        run: |
+          git add README.md
+          git diff --cached --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update version to ${{ steps.get-latest-release.outputs.tag_name }}"
+          git pull --rebase --autostash
+          git push
 
