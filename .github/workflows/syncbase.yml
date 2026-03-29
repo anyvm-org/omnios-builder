@@ -16,7 +16,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with: 
           token: ${{ secrets.VM_TOKEN }}
 
@@ -26,17 +26,20 @@ jobs:
           git clone https://github.com/anyvm-org/base-builder.git
 
       - name: Sync generate.yml
-        uses: anyvm-org/template-render@v0.0.2
+        uses: anyvm-org/template-render@v0.0.4
         with:
           datafile: .github/data/datafile.ini
           files: |
             base-builder/.github/tpl/generate.tpl.yml : .github/workflows/generate.yml
 
-      - uses: EndBug/add-and-commit@v9
-        with:
-          message: "Sync from base-builder"
-          pull: '--rebase --autostash '
-          add: |
-            .github/workflows/generate.yml
+      - name: Commit and push changes
+        run: |
+          git add .github/workflows/generate.yml
+          git diff --cached --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "Sync from base-builder"
+          git pull --rebase --autostash
+          git push
 
 
