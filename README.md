@@ -2,7 +2,7 @@
 
 [![Build](https://github.com/anyvm-org/omnios-builder/actions/workflows/build.yml/badge.svg)](https://github.com/anyvm-org/omnios-builder/actions/workflows/build.yml)
 
-Latest: v2.0.7
+Latest: v2.0.8
 
 
 The image builder for `omnios`
