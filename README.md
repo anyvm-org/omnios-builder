@@ -14,6 +14,8 @@ All the supported releases are here:
 
 | Release | x86_64  |Comments |
 |---------|---------|-----------|
+| r151058 |  ✅     |           |
+| r151058-build |  ✅     |    build-essential |
 | r151056 |  ✅     |           |
 | r151056-build |  ✅     |    build-essential |
 | r151054 |  ✅     |         |
@@ -44,6 +46,6 @@ How to build:
 
     Just clone the repo. and run:
     ```bash
-    bash build.sh conf/omnios-r151056.conf
+    bash build.sh conf/omnios-r151058.conf
     ```
    
