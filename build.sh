@@ -464,7 +464,13 @@ fi
 # Install any requested packages
 if [ "$VM_PRE_INSTALL_PKGS" ]; then
   echo "$VM_INSTALL_CMD $VM_PRE_INSTALL_PKGS"
-  ssh $osname sh <<<"$VM_INSTALL_CMD $VM_PRE_INSTALL_PKGS"
+  ssh $osname sh <<EOF
+    set -e
+
+    $VM_INSTALL_CMD $VM_PRE_INSTALL_PKGS
+
+EOF
+
 fi
 
 if [ -e "hooks/finalize.sh" ]; then
