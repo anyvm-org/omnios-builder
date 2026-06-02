@@ -15,6 +15,15 @@ fi
 
 
 ##############################################################
+# Print the host (runner) CPU so the build log records which physical CPU
+# produced this image. Useful when a guest only boots on some CPU generations
+# (e.g. illumos guests are sensitive to the host's CPUID.0xD / XSAVE layout).
+echo "============== host CPU =============="
+lscpu || cat /proc/cpuinfo || true
+echo "====================================="
+
+
+##############################################################
 osname="$VM_OS_NAME"
 ostype="$VM_OS_TYPE"
 sshport=$VM_SSH_PORT
