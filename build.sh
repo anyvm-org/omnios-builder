@@ -14,13 +14,6 @@ fi
 . "$_conf"
 
 
-##############################################################
-# Print the host (runner) CPU so the build log records which physical CPU
-# produced this image. Useful when a guest only boots on some CPU generations
-# (e.g. illumos guests are sensitive to the host's CPUID.0xD / XSAVE layout).
-echo "============== host CPU =============="
-lscpu || cat /proc/cpuinfo || true
-echo "====================================="
 
 
 ##############################################################
@@ -86,6 +79,20 @@ $vmsh startWeb $osname "needOCR"
 
 
 $vmsh setup "needOCR"
+
+
+
+
+##############################################################
+# Print the host (runner) CPU so the build log records which physical CPU
+# produced this image. Useful when a guest only boots on some CPU generations
+# (e.g. illumos guests are sensitive to the host's CPUID.0xD / XSAVE layout).
+echo "============== host CPU =============="
+lscpu || cat /proc/cpuinfo || true
+echo "====================================="
+
+
+
 
 if ! $vmsh clearVM $osname; then
   echo "vm does not exists"
