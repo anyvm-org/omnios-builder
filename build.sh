@@ -172,6 +172,25 @@ elif [ "$VM_VHD_LINK" ]; then
         zstd -f -d "$_img.zst" -o "$_img"
       fi
       qemu-img convert -f raw -O qcow2 -o preallocation=off "$_img" "$osname.qcow2"
+    elif [[ "$VM_VHD_LINK" == *".img" ]]; then
+      # A ready-to-run disk image such as the Ubuntu cloud image. It is already
+      # in qcow2 format, but normalize it through qemu-img (auto-detects the input
+      # format) so a raw .img works too.
+      _img="$osname.download.img"
+      if [ ! -e "$_img" ]; then
+        $vmsh download "$VM_VHD_LINK" "$_img"
+      fi
+      qemu-img convert -O qcow2 -o preallocation=off "$_img" "$osname.qcow2"
+      rm -f "$_img"
+    elif [[ "$VM_VHD_LINK" == *".qcow2" ]]; then
+      # An uncompressed qcow2 disk image such as the Debian cloud image.
+      # Normalize through qemu-img (auto-detects the input format).
+      _img="$osname.download.qcow2"
+      if [ ! -e "$_img" ]; then
+        $vmsh download "$VM_VHD_LINK" "$_img"
+      fi
+      qemu-img convert -O qcow2 -o preallocation=off "$_img" "$osname.qcow2"
+      rm -f "$_img"
     else
       if [ ! -e "$osname.qcow2.xz" ]; then
         $vmsh download "$VM_VHD_LINK" $osname.qcow2.xz
@@ -179,6 +198,17 @@ elif [ "$VM_VHD_LINK" ]; then
       xz -d -T 0 --verbose  "$osname.qcow2.xz"
     fi
 
+  fi
+
+  # Some cloud images (e.g. Ubuntu) ship with no console password and no SSH key,
+  # so there is no way to log in on first boot. This host-side hook runs after the
+  # qcow2 has been materialized and BEFORE the VM is created, giving the builder a
+  # chance to bake in access (e.g. with virt-customize). No-op for builders that
+  # do not provide it.
+  if [ -e "hooks/prepareImage.sh" ]; then
+    echo "hooks/prepareImage.sh"
+    cat "hooks/prepareImage.sh"
+    . "hooks/prepareImage.sh"
   fi
 
   $vmsh createVMFromVHD $osname $ostype $sshport
@@ -509,6 +539,17 @@ fi
 
 # Done!
 shutdown_and_wait
+
+# Host-side image-finalize hook. Runs AFTER the build VM has shut down (so the
+# qcow2 is the final disk) but BEFORE the ISO is removed below -- the hook may
+# need the ISO (e.g. to boot it as a helper VM and post-process the image, since
+# the Linux build host usually cannot mount the guest's filesystem directly).
+# No-op for builders that do not provide it.
+if [ -e "hooks/finalizeImage.sh" ]; then
+  echo "hooks/finalizeImage.sh"
+  cat "hooks/finalizeImage.sh"
+  . "hooks/finalizeImage.sh"
+fi
 
 ##############################################################
 
