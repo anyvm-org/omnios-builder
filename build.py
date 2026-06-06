@@ -228,9 +228,24 @@ def qmon(command, timeout=2.0):
     return text.replace("\b", "").replace("\r", "")
 
 
+# Pin slirp DHCP to a single address. The slirp built-in DHCP server hands
+# out leases from `dhcpstart` up through .254; setting `dhcpstart=.254`
+# leaves the guest exactly ONE address to take (.254 itself), so a fresh
+# boot always gets the same IP regardless of any stale lease that might
+# survive in the guest's /var. We then bake `-192.168.122.254:22` directly
+# into every hostfwd entry instead of leaving the guest part blank
+# (otherwise slirp forwards to the *first* address it saw, which can race
+# with the guest's actual DHCP completion early in boot).
+SLIRP_EXPECTED_GUEST_IP = SLIRP_PREFIX + "254"
+
+
 def parse_usernet_ip(text):
     """Parse 'info usernet' output for the guest IP. Ported from
-    anyvm.py:get_vm_ip_from_monitor."""
+    anyvm.py:get_vm_ip_from_monitor (anyvm.py:3192-3222).
+
+    Returns the slirp-net IP that originated the most outbound flows, or
+    None if the usernet table has no outbound traffic from the guest yet
+    (idle / not booted enough / headless arch with sleeping NIC)."""
     pat = re.compile(r'^\s*\w+\[[^\]]+\]\s+\d+\s+(\S+)\s+\d+\s+(\S+)\s+\d+', re.M)
     reserved = {0, 1, 2, 3, 255}
     cand = {}
@@ -247,6 +262,74 @@ def parse_usernet_ip(text):
     if cand:
         return max(cand.items(), key=lambda kv: kv[1])[0]
     return None
+
+
+def parse_serial_log_ip(serial_path):
+    """Detect the guest's DHCP-assigned IP by grepping the serial console log.
+    Mirrors anyvm.py:get_vm_ip_from_serial (anyvm.py:3250-3283).
+
+    Many BSDs print their lease on the console during boot (dhclient's
+    "bound to <ip> -- renewal in ..."; rc.d/network's "inet <ip>"). This
+    catches stale-lease cases on headless / -display none arches (riscv64,
+    aarch64 console-build) where slirp's usernet table is still empty
+    during boot-wait. Returns the most recent plausible IP or None."""
+    if not serial_path or not os.path.exists(serial_path):
+        return None
+    try:
+        with open(serial_path, "rb") as f:
+            data = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    reserved = {0, 1, 2, 3, 255}
+    prefix_re = re.escape(SLIRP_PREFIX)
+    found = None
+    for m in re.finditer(r"(?:bound to|inet)\s+(" + prefix_re + r"\d+)", data):
+        ip = m.group(1)
+        try:
+            last = int(ip.rsplit(".", 1)[1])
+        except ValueError:
+            continue
+        if last in reserved:
+            continue
+        found = ip
+    return found
+
+
+def rewrite_hostfwd_target(host_port, new_guest_ip, guest_port=22,
+                           host_addr="127.0.0.1", proto="tcp"):
+    """Rebind one hostfwd entry to point at a new guest IP via the QEMU
+    monitor. Mirrors anyvm.py:rewrite_hostfwd_target (anyvm.py:3224-3248).
+
+    The QEMU monitor returns no body on success and "Error" / "could not" on
+    failure. Returns True only if both remove + add land cleanly."""
+    rem = qmon("hostfwd_remove %s:%s:%s" % (proto, host_addr, host_port)) or ""
+    add = qmon("hostfwd_add %s:%s:%s-%s:%s" % (
+        proto, host_addr, host_port, new_guest_ip, guest_port)) or ""
+    rem_ok = "Error" not in rem and "not found" not in rem.lower()
+    add_ok = "Error" not in add and "could not" not in add.lower()
+    return rem_ok and add_ok
+
+
+def detect_guest_ip(osname=None):
+    """Return the guest's actual DHCP-assigned IP, trying multiple detection
+    methods in order. Returns '' if nothing is found yet.
+
+    1. `info usernet` via the QEMU monitor -- works once the guest makes any
+       outbound TCP connection (the strongest signal once boot's underway).
+    2. Serial console log -- catches the dhclient "bound to <ip>" line which
+       appears before any outbound traffic. Critical for headless / console
+       arches where the usernet table is empty during boot-wait.
+
+    Mirrors the layered probe in anyvm.py:6105-6118."""
+    if osname is None:
+        osname = env("VM_OS_NAME")
+    if not osname:
+        return ""
+    ip = parse_usernet_ip(qmon("info usernet") or "") or ""
+    if ip:
+        return ip
+    ip = parse_serial_log_ip(serial_log(osname)) or ""
+    return ip
 
 
 # ============================================================================
@@ -296,20 +379,118 @@ def qemu_accel():
     return "tcg"
 
 
+# OpenBSD releases whose aarch64/amd64 install media drive e1000 reliably but
+# not virtio. After 7.6 the OpenBSD aarch64 builds switched to virtio-net.
+# Mirrors anyvm.py:OPENBSD_E1000_RELEASES (anyvm.py:110).
+OPENBSD_E1000_RELEASES = {"7.3", "7.4", "7.5", "7.6"}
+
+
 def net_card():
-    """Network device for -device. Confs carry libvirt model names (virtio);
-    translate to QEMU device name. Default e1000."""
-    n = env("VM_NIC") or "e1000"
-    if n in ("virtio", "virtio-net"):
-        return "virtio-net-pci"
-    return n
+    """Network device for -device.
+
+    Mirrors anyvm.py:5185-5214 exactly. An explicit VM_NIC in the conf
+    (libvirt-style model name like `virtio` / `e1000`) wins; otherwise the
+    default is arch-aware (aarch64 -> virtio, else e1000), with per-OS
+    overrides for guests whose installed kernel only ships the other driver:
+
+      * openbsd 7.3..7.6  -> e1000  (older arm64 kernels lack vio(4))
+      * openbsd >=7.7     -> virtio-net-pci
+      * dragonflybsd != 6.4.0 -> virtio-net-pci
+      * riscv64           -> virtio-net-pci  (RISC-V virt has no e1000 PCI BAR)
+      * netbsd aarch64    -> virtio-net-pci  (evbarm GENERIC has vioif, not wm)
+      * freebsd           -> virtio-net-pci  (cloud images: vtnet0 baked in)
+      * ubuntu            -> virtio-net-pci  (cloud-init/netplan pinned to virtio)
+    """
+    n = env("VM_NIC")
+    if n:
+        return "virtio-net-pci" if n in ("virtio", "virtio-net") else n
+
+    arch = env("VM_ARCH") or "x86_64"
+    osname = env("VM_OS_NAME")
+    release = env("VM_RELEASE")
+
+    nic = "virtio-net-pci" if arch == "aarch64" else "e1000"
+    if osname == "openbsd" and release:
+        release_base = release.split("-")[0]
+        nic = "e1000" if release_base in OPENBSD_E1000_RELEASES else "virtio-net-pci"
+    elif osname == "dragonflybsd":
+        if release != "6.4.0":
+            nic = "virtio-net-pci"
+    elif arch == "riscv64":
+        nic = "virtio-net-pci"
+    elif osname == "netbsd" and arch == "aarch64":
+        nic = "virtio-net-pci"
+    elif osname == "freebsd":
+        nic = "virtio-net-pci"
+    elif osname == "ubuntu":
+        nic = "virtio-net-pci"
+    return nic
+
+
+# OpenBSD/amd64 release suffixes that imply a desktop image (X11). Mirrors
+# anyvm.py:4437. These releases get -vga cirrus because xenocara's only
+# working QEMU driver on amd64 is xf86-video-cirrus.
+_OPENBSD_DESKTOP_SUFFIXES = (
+    "-xfce", "-gnome", "-kde", "-kde6", "-mate",
+    "-lxqt", "-lumina", "-enlightenment", "-cinnamon",
+)
+
+
+def vga_type():
+    """Decide the QEMU video device. Mirrors anyvm.py:4430-4458, plus
+    anyvm.py:5304-5306 (aarch64 virtio -> virtio-gpu-pci) and 5441-5444
+    (x86 -> -vga argument).
+
+    The conf can pin a value via VM_VGA (libvirt-style: std / virtio /
+    cirrus / virtio-gpu / qxl); when unset the OS-aware default is:
+
+      * netbsd amd64           -> std   (NetBSD has no DRM for virtio-gpu)
+      * haiku                  -> std   (its driver doesn't match virtio-vga)
+      * openbsd amd64 desktop  -> cirrus (xenocara only ships xf86-video-cirrus)
+      * else                   -> virtio
+
+    `virtio` is normalized to `virtio-vga` on x86 and `virtio-gpu-pci` on
+    aarch64 by the caller that emits `-vga` vs `-device`.
+    """
+    v = env("VM_VGA")
+    if v:
+        return v
+    osname = env("VM_OS_NAME")
+    arch = env("VM_ARCH") or "x86_64"
+    release = env("VM_RELEASE") or ""
+    if osname == "netbsd" and arch != "aarch64":
+        return "std"
+    if osname == "haiku":
+        return "std"
+    if (osname == "openbsd" and arch != "aarch64"
+            and any(release.endswith(s) for s in _OPENBSD_DESKTOP_SUFFIXES)):
+        return "cirrus"
+    return "virtio"
 
 
 def disk_if():
     """Disk bus for -drive if=. VM_DISK may carry extra attrs; keep only the
-    leading bus token (so 'virtio,discard=unmap' -> 'virtio')."""
-    d = (env("VM_DISK") or "virtio").split(",", 1)[0]
-    return d or "virtio"
+    leading bus token (so 'virtio,discard=unmap' -> 'virtio').
+
+    When VM_DISK is unset, the OS-aware default mirrors anyvm.py:5058-5081 so a
+    builder whose conf forgets VM_DISK still gets the right enumeration in the
+    guest:
+
+      * dragonflybsd -> ide  (guest BIOS bootloader pinned to ad0)
+      * ghostbsd     -> ide  (pc-sysinstall + ada0 + SeaBIOS)
+      * tribblix     -> sata (live_install.sh installs to c2t0d0 via AHCI)
+      * else         -> virtio
+    """
+    raw = env("VM_DISK")
+    if raw:
+        d = raw.split(",", 1)[0]
+        return d or "virtio"
+    osname = env("VM_OS_NAME")
+    if osname in ("dragonflybsd", "ghostbsd"):
+        return "ide"
+    if osname == "tribblix":
+        return "sata"
+    return "virtio"
 
 
 def obsd_acpi_off():
@@ -334,13 +515,70 @@ def copy_into(src, dst):
     with open(dst, "r+b") as d: d.seek(0); d.write(data)
 
 
-AARCH64_EFI_CANDIDATES = [
-    "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
-    "/usr/share/AAVMF/AAVMF_CODE.fd",
-    "/usr/share/qemu/edk2-aarch64-code.fd",
-    "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
-    "/usr/local/share/qemu/edk2-aarch64-code.fd",
+def _aarch64_efi_search_dirs(qemu_bin=None):
+    """Mirrors anyvm.py:5224-5231. Search next to the qemu binary first
+    (relocated qemu installs honored), then the system paths."""
+    dirs = []
+    if qemu_bin:
+        try:
+            qpref = os.path.dirname(os.path.dirname(os.path.realpath(qemu_bin)))
+            dirs.append(os.path.join(qpref, "share"))
+        except Exception:
+            pass
+    dirs += ["/usr/share", "/opt/homebrew/share", "/usr/local/share"]
+    return dirs
+
+
+# Relative paths under each search dir where aarch64 EDK2 CODE firmware lives.
+# Mirrors anyvm.py:5232-5238. Order = preference (Debian/Ubuntu first).
+_AARCH64_EFI_CODE_RELNAMES = [
+    os.path.join("edk2", "aarch64", "QEMU_EFI.fd"),
+    os.path.join("qemu-efi-aarch64", "QEMU_EFI.fd"),
+    os.path.join("AAVMF", "AAVMF_CODE.fd"),
+    os.path.join("qemu", "edk2-aarch64-code.fd"),
+    os.path.join("edk2", "aarch64", "QEMU_EFI-pflash.raw"),
 ]
+
+
+def _find_aarch64_efi_code(qemu_bin=None):
+    """Locate the aarch64 EDK2 CODE firmware. Returns full path or ''."""
+    for d in _aarch64_efi_search_dirs(qemu_bin):
+        for rn in _AARCH64_EFI_CODE_RELNAMES:
+            p = os.path.join(d, rn)
+            if os.path.exists(p):
+                return p
+    return ""
+
+
+def _find_aarch64_efi_vars(code_src):
+    """Find the VARS template matching the given CODE firmware. anyvm.py:5272-5288.
+
+    EDK2 ships a pre-formatted NVRAM template next to the CODE blob; using a
+    blank vars region instead crashes NetBSD evbarm + (sometimes) other guests
+    with SetVariable-NVRAM-init failures that present as reboot loops at the
+    [1.000xxx] kernel mark. Try matching templates by name; return '' if none."""
+    if not code_src:
+        return ""
+    d = os.path.dirname(code_src)
+    base = os.path.basename(code_src)
+    guesses = []
+    for a, b in [("QEMU_EFI", "QEMU_VARS"), ("_CODE", "_VARS"),
+                 ("-code", "-vars"), ("CODE", "VARS")]:
+        if a in base:
+            guesses.append(os.path.join(d, base.replace(a, b)))
+    guesses += [
+        os.path.join(d, "QEMU_VARS.fd"),
+        os.path.join(d, "vars-template-pflash.raw"),
+        os.path.join(d, "AAVMF_VARS.fd"),
+    ]
+    for g in guesses:
+        if g != code_src and os.path.exists(g):
+            return g
+    return ""
+
+
+# Legacy alias kept for any in-tree references.
+AARCH64_EFI_CANDIDATES = []
 
 
 def build_qemu_args(media_kind=None, media_path=None):
@@ -369,22 +607,48 @@ def build_qemu_args(media_kind=None, media_path=None):
     # RTC: `driftfix=slew` matches libvirt's `<timer name='rtc' tickpolicy='catchup'/>`
     # -- when KVM drops RTC interrupts under load, slew the guest clock forward
     # instead of dropping ticks (illumos / older BSDs hate ticks vanishing).
+    # Haiku and Windows read the RTC as local time, not UTC; using UTC there
+    # offsets the wall clock by the timezone (TLS / cert breakage). Mirrors
+    # anyvm.py:5173-5176.
+    rtc_base = "localtime" if osname in ("windows", "haiku") else "utc"
     a += ["-name", osname, "-m", "6144", "-smp", env("VM_CPU") or "2",
-          "-rtc", "base=utc,driftfix=slew"]
+          "-rtc", "base=%s,clock=host,driftfix=slew" % rtc_base]
+    # slirp DHCP pinned to .254 (see SLIRP_EXPECTED_GUEST_IP for rationale).
+    # hostfwd target is the explicit guest IP so port forwarding never races
+    # the guest's DHCP-bound state.
     a += ["-netdev", "user,id=net0,net=192.168.122.0/24,host=192.168.122.1,"
-          "dhcpstart=192.168.122.10,ipv6=off,hostfwd=tcp:127.0.0.1:%s-:22" % sshport]
-    a += ["-object", "rng-builtin,id=rng0",
-          "-device", "virtio-rng-pci,rng=rng0,max-bytes=1024,period=1000"]
+          "dhcpstart=192.168.122.254,ipv6=off,"
+          "hostfwd=tcp:127.0.0.1:%s-192.168.122.254:22" % sshport]
+    # virtio-rng-pci for all guests EXCEPT solaris -- Solaris does not have
+    # a virtio-rng driver and the unrecognized device disrupts early boot.
+    # Mirrors anyvm.py:5627.
+    if osname != "solaris":
+        a += ["-object", "rng-builtin,id=rng0",
+              "-device", "virtio-rng-pci,rng=rng0,max-bytes=1024,period=1000"]
 
     if arch == "aarch64":
         efi = "%s-QEMU_EFI.fd" % osname
         varsf = "%s-QEMU_EFI_VARS.fd" % osname
+        code_src = _find_aarch64_efi_code(resolve_qemu_bin())
         if not os.path.exists(efi):
+            if not code_src:
+                log("aarch64 UEFI CODE firmware not found "
+                    "(install edk2-aarch64 / qemu-efi-aarch64)")
             make_blank(efi, 64)
-            for c in AARCH64_EFI_CANDIDATES:
-                if os.path.exists(c): copy_into(c, efi); break
+            if code_src:
+                copy_into(code_src, efi)
         if not os.path.exists(varsf):
             make_blank(varsf, 64)
+            # Crucial: NetBSD evbarm + (sometimes) other aarch64 guests reboot
+            # in a 3-second loop on a completely blank vars pflash because EDK2
+            # cannot initialize NVRAM. Copy the matching VARS template instead.
+            vars_src = _find_aarch64_efi_vars(code_src)
+            if vars_src:
+                log("aarch64 vars template: %s" % vars_src)
+                copy_into(vars_src, varsf)
+            else:
+                log("aarch64 UEFI VARS template not found; using blank store "
+                    "(this can cause guest reboot loops on NetBSD evbarm)")
         mopts = "virt,accel=%s,gic-version=3,usb=on" % accel
         if obsd_acpi_off(): mopts += ",acpi=off"
         if accel in ("kvm", "hvf"): cpu = "host"
@@ -394,7 +658,13 @@ def build_qemu_args(media_kind=None, media_path=None):
         a += ["-device", "qemu-xhci", "-device", "%s,netdev=net0" % nic]
         a += ["-drive", "if=pflash,format=raw,readonly=on,file=%s" % efi]
         a += ["-drive", "if=pflash,format=raw,file=%s,unit=1" % varsf]
-        a += ["-device", "virtio-gpu-pci"]
+        # VGA device. anyvm.py:5304-5306 -- 'virtio' / 'virtio-gpu' normalize
+        # to 'virtio-gpu-pci' on aarch64 (the only working PCI VGA model on
+        # the virt machine). std on aarch64 has no QEMU implementation.
+        vga = vga_type()
+        if vga in ("virtio", "virtio-gpu", "std", ""):
+            vga = "virtio-gpu-pci"
+        a += ["-device", vga]
         a += ["-drive", "file=%s,format=qcow2,if=none,id=disk0,discard=unmap,detect-zeroes=unmap" % qcow]
         if media_kind == "disk":
             a += ["-drive", "file=%s,format=raw,if=none,id=inst0" % media_path]
@@ -432,15 +702,29 @@ def build_qemu_args(media_kind=None, media_path=None):
     else:
         # x86_64 (and any other PC-class arch).
         a += ["-machine", "pc,accel=%s,hpet=off,smm=off,graphics=on,vmport=off,usb=on" % accel]
+        # Mirrors anyvm.py:5413-5439.
         if accel == "kvm":
-            # Match anyvm.py runtime exactly (which has been tuned across all
-            # the OS images). +invtsc gives a stable TSC -- illumos / Solaris
-            # / older BSDs deadlock or drift if TSC reads vary across vCPUs.
-            cpu = "host,kvm=on,l3-cache=on,+hypervisor,migratable=no,+invtsc,pmu=off"
+            if osname == "dragonflybsd":
+                # DragonFlyBSD's early-boot init writes to MSRs that vary by
+                # runner CPU generation. -cpu host exposes too much; even
+                # pmu=off was not enough to stop intermittent #GP-in-wrmsr
+                # right after TSC calibration. Lock to a stable named model
+                # so guest CPUID is identical across all runner hardware.
+                # Note: named CPU models do NOT support `migratable` or
+                # `l3-cache` properties (those are -cpu host only).
+                cpu = "Broadwell-v4,+hypervisor,+invtsc"
+            else:
+                cpu = "host,kvm=on,l3-cache=on,+hypervisor,migratable=no,+invtsc"
         elif accel == "hvf":
             cpu = "host,+rdrand,+rdseed"
         else:
             cpu = "qemu64,+rdrand,+rdseed"
+        # Disable the guest PMU. Exposing the host PMU via -cpu host can
+        # trigger intermittent #GP-in-wrmsr crashes during early guest boot
+        # (notably DragonFlyBSD) when the runner CPU generation exposes PMU
+        # MSRs that KVM refuses writes to.
+        if accel in ("kvm", "hvf"):
+            cpu += ",pmu=off"
         a += ["-cpu", cpu]
         # PIT lost-tick policy: libvirt-era XML carried
         # `<timer name='pit' tickpolicy='delay'/>`. Without it, QEMU's KVM
@@ -473,7 +757,9 @@ def build_qemu_args(media_kind=None, media_path=None):
                   "-boot", "order=dc,menu=off"]
         elif media_kind == "disk":
             a += ["-drive", "file=%s,format=raw,if=ide" % media_path]
-        a += ["-vga", "std"]
+        # VGA device, anyvm.py:5441-5444. NetBSD/Haiku -> std,
+        # OpenBSD desktop -> cirrus, default -> virtio (= virtio-vga on x86).
+        a += ["-vga", vga_type()]
 
     # VNC display number = port - 5900 (display :N <-> TCP 5900+N).
     a += ["-display", "vnc=127.0.0.1:%d" % (vncport - 5900)]
@@ -1626,10 +1912,15 @@ def conf_load(path):
 # (M) Build pipeline (was build.sh)
 # ============================================================================
 
-def _ssh_ready_check(timeout=2):
+def _ssh_ready_check(timeout=10):
     """Return True if `ssh $VM_OS_NAME exit` succeeds within `timeout` seconds.
     Uses subprocess.run(timeout=...) instead of the external `timeout` binary;
-    on TimeoutExpired the child is killed and we return False."""
+    on TimeoutExpired the child is killed and we return False.
+
+    Default 10 s -- short enough that retry polling stays snappy, long enough
+    to cover SSH banner + key exchange + auth on slow guests (illumos sshd
+    in particular takes 4-5 s for the full handshake even on a healthy KVM
+    boot; an over-tight 2 s window misreads a working sshd as down)."""
     osname = env("VM_OS_NAME")
     if not osname: return False
     cmd = ["ssh",
@@ -1646,16 +1937,56 @@ def _ssh_ready_check(timeout=2):
 
 
 def _wait_ssh(max_retries=100, restart_cb=None):
-    """Poll ssh until reachable; optional restart_cb runs once on failure."""
-    retry = 0; restarted = False
-    while not _ssh_ready_check(2):
+    """Poll ssh through the hostfwd port until reachable; optional restart_cb
+    runs once on terminal failure.
+
+    Every retry we ALSO run the layered IP probe (anyvm.py:6100-6118
+    "hostfwd guard"): under slirp the guest's DHCP lease should be
+    192.168.122.10 (matching the hostfwd we wired at launch), but stale
+    leases / DHCP pickup races can land it on .11 / .12 / ... in which case
+    the host-side ssh through hostfwd hits a dead IP forever. When we
+    detect a different actual IP we rewrite the hostfwd via the monitor on
+    the fly so the very next ssh probe lands on the right guest.
+
+    Detection cascade (mirrors anyvm.py:6109):
+      1. `info usernet` -- slirp's outbound flow table
+      2. serial.log    -- dhclient's "bound to <ip>" / rc.d's "inet <ip>"
+    """
+    osname = env("VM_OS_NAME") or ""
+    sshport_str = read_state(osname, "sshport") or "22"
+    try:
+        sshport = int(sshport_str)
+    except ValueError:
+        sshport = 22
+    retry = 0
+    restarted = False
+    guard_done = False
+    while not _ssh_ready_check(10):
         log("ssh is not ready, just wait.")
-        time.sleep(10); retry += 1
+        if not guard_done:
+            actual = detect_guest_ip(osname)
+            if actual:
+                if actual == SLIRP_EXPECTED_GUEST_IP:
+                    log("guest IP %s matches hostfwd target, ok" % actual)
+                    guard_done = True
+                else:
+                    log("guest IP %s != expected %s; rewriting hostfwd via monitor"
+                        % (actual, SLIRP_EXPECTED_GUEST_IP))
+                    if rewrite_hostfwd_target(sshport, actual):
+                        log("hostfwd rewritten to %s:22" % actual)
+                        guard_done = True
+                    else:
+                        log("hostfwd rewrite failed; will retry next iteration")
+        time.sleep(10)
+        retry += 1
         if retry > max_retries:
             if restarted or not restart_cb:
                 log("ssh is failed."); return False
             log("ssh failed; trying restart")
-            restarted = True; restart_cb(); retry = 0
+            restarted = True
+            restart_cb()
+            retry = 0
+            guard_done = False  # new boot, recheck IP
     return True
 
 
@@ -1973,7 +2304,7 @@ def main(argv):
     else:
         addSSHAuthorizedKeys("%s-id_rsa.pub" % output)
         startVM()
-        while not _ssh_ready_check(timeout=5):
+        while not _ssh_ready_check(timeout=10):
             log("not ready yet, just sleep."); time.sleep(5)
         if not _send_env_check():
             return 1
