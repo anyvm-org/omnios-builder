@@ -354,7 +354,11 @@ def build_qemu_args(media_kind=None, media_path=None):
     a += ["-chardev", "socket,id=serial0,host=127.0.0.1,port=%s,server=on,wait=off,logfile=%s" % (serport, serlog)]
     a += ["-serial", "chardev:serial0"]
     a += ["-monitor", "tcp:127.0.0.1:%s,server,nowait,nodelay" % monport]
-    a += ["-name", osname, "-m", "6144", "-smp", env("VM_CPU") or "2", "-rtc", "base=utc"]
+    # RTC: `driftfix=slew` matches libvirt's `<timer name='rtc' tickpolicy='catchup'/>`
+    # -- when KVM drops RTC interrupts under load, slew the guest clock forward
+    # instead of dropping ticks (illumos / older BSDs hate ticks vanishing).
+    a += ["-name", osname, "-m", "6144", "-smp", env("VM_CPU") or "2",
+          "-rtc", "base=utc,driftfix=slew"]
     a += ["-netdev", "user,id=net0,net=192.168.122.0/24,host=192.168.122.1,"
           "dhcpstart=192.168.122.10,ipv6=off,hostfwd=tcp:127.0.0.1:%s-:22" % sshport]
     a += ["-object", "rng-builtin,id=rng0",
@@ -416,18 +420,45 @@ def build_qemu_args(media_kind=None, media_path=None):
     else:
         # x86_64 (and any other PC-class arch).
         a += ["-machine", "pc,accel=%s,hpet=off,smm=off,graphics=on,vmport=off,usb=on" % accel]
-        if accel == "kvm":   cpu = "host,+rdrand,+rdseed,pmu=off"
-        elif accel == "hvf": cpu = "host,+rdrand,+rdseed"
-        else:                cpu = "qemu64,+rdrand,+rdseed"
+        if accel == "kvm":
+            # Match anyvm.py runtime exactly (which has been tuned across all
+            # the OS images). +invtsc gives a stable TSC -- illumos / Solaris
+            # / older BSDs deadlock or drift if TSC reads vary across vCPUs.
+            cpu = "host,kvm=on,l3-cache=on,+hypervisor,migratable=no,+invtsc,pmu=off"
+        elif accel == "hvf":
+            cpu = "host,+rdrand,+rdseed"
+        else:
+            cpu = "qemu64,+rdrand,+rdseed"
         a += ["-cpu", cpu]
+        # PIT lost-tick policy: libvirt-era XML carried
+        # `<timer name='pit' tickpolicy='delay'/>`. Without it, QEMU's KVM
+        # PIT backend drops lost interrupts, which illumos kernels (OmniOS,
+        # OpenIndiana, Solaris) interpret as the system stalling and either
+        # spin or hang. `delay` queues missed ticks instead. Cheap to set
+        # for every x86 guest; only the KVM backend cares about the global,
+        # so it's a no-op under TCG / HVF.
+        if accel == "kvm":
+            a += ["-global", "kvm-pit.lost_tick_policy=delay"]
         a += ["-device", "%s,netdev=net0" % nic, "-device", "virtio-balloon-pci"]
+        # Pin the install CDROM (when present) to IDE primary master,
+        # matching the libvirt-era release XML (`<target dev='hda' bus='ide'/>`).
+        # That makes the guest see it as cd0a -- NetBSD sysinst's default
+        # mount path. QEMU's `-cdrom` shortcut puts it at IDE index=2
+        # (secondary master = cd1a), which NetBSD then fails to mount and
+        # falls into the "Distribution medium" menu loop.
+        # When the main disk is also on IDE (dragonflybsd / ghostbsd:
+        # VM_DISK=ide), shift it to secondary master to avoid colliding
+        # with the cdrom slot.
         if dif == "sata":
             a += ["-drive", "file=%s,format=qcow2,if=none,id=disk0,discard=unmap,detect-zeroes=unmap" % qcow]
             a += ["-device", "ich9-ahci,id=ahci0", "-device", "ide-hd,bus=ahci0.0,drive=disk0"]
+        elif dif == "ide" and media_kind == "cdrom":
+            a += ["-drive", "file=%s,format=qcow2,if=ide,index=2,discard=unmap,detect-zeroes=unmap" % qcow]
         else:
             a += ["-drive", "file=%s,format=qcow2,if=%s,discard=unmap,detect-zeroes=unmap" % (qcow, dif)]
         if media_kind == "cdrom":
-            a += ["-cdrom", media_path, "-boot", "order=dc,menu=off"]
+            a += ["-drive", "file=%s,format=raw,if=ide,index=0,media=cdrom" % media_path,
+                  "-boot", "order=dc,menu=off"]
         elif media_kind == "disk":
             a += ["-drive", "file=%s,format=raw,if=ide" % media_path]
         a += ["-vga", "std"]
