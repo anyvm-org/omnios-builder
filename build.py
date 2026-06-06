@@ -728,6 +728,35 @@ def setup(install_ocr=None):
         if env("VM_ARCH") == "aarch64":
             _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
                         "qemu-system-arm", "qemu-efi-aarch64"], env=apt_env)
+        # Make /dev/kvm usable by the current shell user. On GitHub Actions
+        # runners (and most desktop distros) the device is mode crw-rw----
+        # root:kvm and the runner / login user is NOT in the kvm group, so
+        # qemu_accel() falls back to tcg even when KVM is available. The
+        # libvirt-era builder didn't hit this because virt-install ran the
+        # guest as the libvirt-qemu / qemu system user which IS in kvm; raw
+        # QEMU runs as us, so we have to open the device ourselves.
+        #
+        # Best-effort: a developer running build.py locally may not have
+        # passwordless sudo (or any sudo at all). In that case we just warn
+        # and let qemu_accel() fall back to tcg -- the build still works,
+        # only slower. Use `sudo -n` so we never block on a password prompt.
+        if os.path.exists("/dev/kvm") and not os.access("/dev/kvm",
+                                                       os.R_OK | os.W_OK):
+            try:
+                r = subprocess.run(["sudo", "-n", "chmod", "666", "/dev/kvm"],
+                                   capture_output=True, text=True, timeout=10)
+                if r.returncode == 0 and os.access("/dev/kvm",
+                                                   os.R_OK | os.W_OK):
+                    log("setup: chmod 666 /dev/kvm -- KVM acceleration enabled")
+                else:
+                    log("setup: cannot relax /dev/kvm permissions "
+                        "(no passwordless sudo, or user lacks privilege); "
+                        "KVM unavailable, falling back to TCG. To enable KVM, "
+                        "add this user to the 'kvm' group or run "
+                        "`sudo chmod 666 /dev/kvm` manually before building.")
+            except (subprocess.TimeoutExpired, OSError) as e:
+                log("setup: chmod /dev/kvm attempt failed (%s); "
+                    "KVM unavailable, falling back to TCG." % e)
     else:
         _run_quiet(["brew", "install", "tesseract", "qemu"])
         _sh_quiet("pip3 install -q pytesseract opencv-python vncdotool")
