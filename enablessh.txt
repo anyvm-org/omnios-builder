@@ -14,6 +14,7 @@ echo 'AcceptEnv   *'  >> /etc/ssh/sshd_config
 ssh-keygen -t rsa -f ~/.ssh/id_rsa -q -N ''
 
 
+sudo svcadm enable ssh
 sudo svcadm restart ssh
 
 
