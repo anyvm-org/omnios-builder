@@ -20,16 +20,20 @@ OmniOS | enter
 
 
 #Please identify a location so that time zone rules can be set correctly
-Please select a continent |  enter 
+# Continent + country may auto-skip after ZFS finishes on newer releases;
+# short timeouts let us fall through and press enter on the TZ confirm
+# screen instead of waiting forever.
+Please select a continent | enter | 60
+
+the above information | enter | 60
 
 
-#Is the above information OK | enter | 10
+# Final pre-install summary; newer releases flash this very briefly.
+The following information has been given | enter | 60
 
-
-
-The following information has been given | enter
-
-Installation Complete | enter
+# r151058 says "rpool now has a working and mounted boot environment" instead
+# of "Installation Complete"; match the OCR-stable bit at the bottom.
+back at the main menu | enter | 600
 
 
 

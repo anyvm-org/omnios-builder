@@ -21,33 +21,34 @@ Omni | enter
 
 
 #Please identify a location so that time zone rules can be set correctly
-Please select a continent |  enter  
+# Continent + country may auto-skip after ZFS finishes on r151058; give it
+# a short timeout so we fall through and press enter on the TZ confirm
+# screen instead of waiting forever.
+Please select a continent | enter | 60
+
+the above information | enter | 60
 
 
-#Is the above information OK | enter |  10
+# Final pre-install summary; r151058 only flashes this very briefly. Don't
+# block the pipeline if we miss it.
+The following information has been given | enter | 30
 
 
+# Post-install reboot: OmniOS r151058 drops *back into the installed system*
+# (it auto-rebooted from disk; boot order is dc, no need to eject the ISO),
+# and first-boot init drops straight into the OmniOS configuration menu
+# (Network / SSH / Timezone / ...). Skip the obsolete "Welcome to the
+# OmniOS installer" main-menu screen and wait directly for the config menu.
+# Timeout is generous because reboot + first-boot init takes a few minutes
+# under tcg, less under kvm.
 
-The following information has been given | enter
+# Configure network -> DHCP (hot key "c"). Doubled to ride out a transient
+# miss; second "c; enter" lands on the next sub-prompt and accepts it.
+configuration menu | string c; enter;string c; enter; enter | 600
 
-Installation Complete | enter
-
-
-
-
-#Welcome to the OmniOS installer
-
-Welcome to | enter
-
-
-
-#OmniOS configuration menu
-
-# for dhcp 
-configuration menu | string c; enter;string c; enter; enter
-
-#enable ssh server
-configuration menu | string s;string s; enter; enter;  string h; enter; sleep 10
+# Enable SSH server, then halt (hot keys s/s then h). build.py polls until
+# the VM powers off and proceeds to the export step.
+configuration menu | string s;string s; enter; enter;  string h; enter; sleep 10 | 600
 
 
 
