@@ -9,7 +9,7 @@ on:
     branches:
       - '*'
     paths:
-      - '*.sh'
+      - 'build.py'
       - '.github/workflows/build.yml'
       - '*.txt'
       - 'conf/*'
@@ -18,7 +18,7 @@ on:
     branches:
       - '*'
     paths:
-      - '*.sh'
+      - 'build.py'
       - '.github/workflows/build.yml'
       - '*.txt'
       - 'conf/*'
@@ -58,7 +58,7 @@ jobs:
         protocol: http
         port: 8000
     - run: |
-        bash build.sh conf/omnios-${{ matrix.os }}.conf
+        python3 build.py conf/omnios-${{ matrix.os }}.conf
     - name: Upload Release Asset
       if: "contains(github.ref, 'refs/tags/')"
       id: upload-release-asset

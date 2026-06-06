@@ -27,6 +27,6 @@ How to build:
 
     Just clone the repo. and run:
     ```bash
-    bash build.sh {{LATEST_CONF}}
+    python3 build.py {{LATEST_CONF}}
     ```
    

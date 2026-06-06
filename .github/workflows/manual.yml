@@ -30,7 +30,7 @@ jobs:
         latest=$(cat $(ls conf/omnios-*.conf | tail -1) | grep VM_RELEASE | cut -d = -f 2)
         echo "please loging to ssh below, and run:"
         echo "============================="
-        echo "bash build.sh conf/omnios-$latest.conf"
+        echo "python3 build.py conf/omnios-$latest.conf"
         echo "============================="
         touch /tmp/keepalive
 
