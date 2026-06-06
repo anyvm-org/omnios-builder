@@ -1,8 +1,7 @@
 #
 #
 
-US-English  | enter
-
+Please select a keyboard | enter
 #Welcome to the OmniOS installer
 Welcome to |  enter
 
