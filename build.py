@@ -164,6 +164,17 @@ def free_port(start, end):
     return 0
 
 
+def vnc_server():
+    """vncdotool '-s' target for this VM's VNC port. build_qemu_args picks a
+    free 5900-5999 port per VM (write_state 'vncport') and binds QEMU's VNC
+    display to it; we fall back to 5900 (display :0) when it isn't allocated
+    yet. Pointing every vncdotool call at the right port lets several
+    builders run on one host without colliding on the default VNC port."""
+    osname = env("VM_OS_NAME")
+    port = (read_state(osname, "vncport") if osname else "") or "5900"
+    return ["-s", "127.0.0.1::%s" % port]
+
+
 def tail_file(path, n):
     try:
         with open(path, errors="replace") as f:
@@ -341,6 +352,7 @@ def build_qemu_args(media_kind=None, media_path=None):
 
     monport = free_port(4444, 4544); write_state(osname, "monport", monport)
     serport = free_port(7000, 9000); write_state(osname, "serport", serport)
+    vncport = free_port(5900, 5999); write_state(osname, "vncport", vncport)
     serlog = "%s.serial.log" % osname
     try: os.remove(serlog)
     except OSError: pass
@@ -463,7 +475,8 @@ def build_qemu_args(media_kind=None, media_path=None):
             a += ["-drive", "file=%s,format=raw,if=ide" % media_path]
         a += ["-vga", "std"]
 
-    a += ["-display", "vnc=127.0.0.1:0"]
+    # VNC display number = port - 5900 (display :N <-> TCP 5900+N).
+    a += ["-display", "vnc=127.0.0.1:%d" % (vncport - 5900)]
     if not console and arch != "aarch64":
         a += ["-device", "usb-tablet"]
     return a
@@ -487,8 +500,9 @@ def launch_qemu(media_kind=None, media_path=None):
         log("QEMU failed to start for %s; tail of %s.qemu.log:" % (osname, osname))
         log(tail_file("%s.qemu.log" % osname, 50))
         return 1
-    log("QEMU started: pid=%d vnc=127.0.0.1:0 monitor=%s serial=%s"
-        % (p.pid, read_state(osname, "monport"), read_state(osname, "serport")))
+    log("QEMU started: pid=%d vnc=127.0.0.1::%s monitor=%s serial=%s"
+        % (p.pid, read_state(osname, "vncport"), read_state(osname, "monport"),
+           read_state(osname, "serport")))
     return 0
 
 
@@ -922,9 +936,10 @@ def _wait_vm_down(what="VM", poll=20):
     osname = env("VM_OS_NAME") or "vm"
     monport = read_state(osname, "monport")
     serport = read_state(osname, "serport")
-    log("waiting for %s to power off (poll %ds; vnc 127.0.0.1:0, "
+    vncport = read_state(osname, "vncport") or "5900"
+    log("waiting for %s to power off (poll %ds; vnc 127.0.0.1::%s, "
         "monitor 127.0.0.1:%s, serial 127.0.0.1:%s -> %s.serial.log)"
-        % (what, poll, monport, serport, osname))
+        % (what, poll, vncport, monport, serport, osname))
     elapsed = 0
     while isRunning() == 0:
         time.sleep(poll)
@@ -943,6 +958,7 @@ def clearVM():
     closeConsole()
     for f in ["%s.qcow2" % osname, "%s.img" % osname, "%s.pid" % osname,
               "%s.monport" % osname, "%s.serport" % osname, "%s.sshport" % osname,
+              "%s.vncport" % osname,
               "%s.serial.log" % osname, "%s.qemu.log" % osname, "%s.cmdline" % osname,
               "%s-QEMU_EFI.fd" % osname, "%s-QEMU_EFI_VARS.fd" % osname]:
         try: os.remove(f)
@@ -987,7 +1003,7 @@ def ocr(img):
 
 def vnc_capture(pngpath):
     while True:
-        rc = subprocess.run(["vncdotool", "capture", pngpath],
+        rc = subprocess.run(["vncdotool"] + vnc_server() + ["capture", pngpath],
                            stdout=DEVNULL, stderr=DEVNULL).returncode
         if rc == 0: return
         time.sleep(3)
@@ -1003,29 +1019,29 @@ def vnc_capture(pngpath):
 def vncKey(key):
     """Send a key event over VNC. `key` is a vncdotool name like 'enter',
     'right', 'tab', 'super-alt-t', 'ctrl-c'."""
-    return subprocess.run(["vncdotool", "key", str(key)]).returncode
+    return subprocess.run(["vncdotool"] + vnc_server() + ["key", str(key)]).returncode
 
 
 def vncMove(x, y):
     """Move the VNC pointer to absolute (x, y)."""
-    return subprocess.run(["vncdotool", "move", str(x), str(y)]).returncode
+    return subprocess.run(["vncdotool"] + vnc_server() + ["move", str(x), str(y)]).returncode
 
 
 def vncClick(button=1):
     """Click a VNC mouse button (1=left, 2=middle, 3=right)."""
-    return subprocess.run(["vncdotool", "click", str(button)]).returncode
+    return subprocess.run(["vncdotool"] + vnc_server() + ["click", str(button)]).returncode
 
 
 def vncMoveClick(x, y, button=1):
     """Move the pointer to (x, y) and click `button`, in one vncdotool call
     (single TCP round trip to the VNC server)."""
-    return subprocess.run(["vncdotool", "move", str(x), str(y),
+    return subprocess.run(["vncdotool"] + vnc_server() + ["move", str(x), str(y),
                            "click", str(button)]).returncode
 
 
 def vncType(text):
     """Type a literal string over VNC (with --force-caps for layout safety)."""
-    return subprocess.run(["vncdotool", "--force-caps", "type", text]).returncode
+    return subprocess.run(["vncdotool"] + vnc_server() + ["--force-caps", "type", text]).returncode
 
 
 def _write_index_html(text):
@@ -1077,19 +1093,25 @@ def screenTextValue():
 
 def waitForText(text=None, sec="", hook=None):
     """Poll the screen (VNC OCR or serial-console capture) every 3 s until
-    `text` is found in it, or `sec` seconds elapse. If `hook` is given, call
-    it on every poll BEFORE the screen capture -- useful for re-asserting an
-    action that may have been swallowed across a guest state change (e.g.
-    sending Ctrl+Alt+F2 every poll until the text console getty appears).
-    `hook` may be a Python callable (preferred) or a shell command string
-    (run via `bash -c ...`, kept for porting old hooks)."""
+    `text` is found in it, or `sec` *wall-clock seconds* elapse. If `hook` is
+    given, call it on every poll BEFORE the screen capture -- useful for
+    re-asserting an action that may have been swallowed across a guest state
+    change (e.g. sending Ctrl+Alt+F2 every poll until the text console getty
+    appears). `hook` may be a Python callable (preferred) or a shell command
+    string (run via `bash -c ...`, kept for porting old hooks).
+
+    Both code paths -- match and timeout -- return 0, so the caller's
+    processOpts unconditionally fires the keystrokes regardless of outcome
+    (intentional: if a screen we expected never showed up, pressing the keys
+    anyway often advances the installer to the next screen we DO recognise).
+    """
     if not text:
         log("Usage: waitForText text [sec]"); return 1
     if not _check_osname("waitForText"): return 1
     sec = (str(sec) or "").strip()
     log("Waiting for text: %s" % text)
-    t = 0
-    while (not sec) or (t < int(sec)):
+    deadline = time.time() + int(sec) if sec else None
+    while (deadline is None) or (time.time() < deadline):
         if hook is not None:
             try:
                 if callable(hook):
@@ -1108,7 +1130,6 @@ def waitForText(text=None, sec="", hook=None):
             log("====> OK, found: %s" % text); return 0
         elif env("DEBUG"):
             log("Not found for text: %s" % text)
-        t += 1
     log("Timeout for text: %s" % text)
     return 0
 
@@ -1249,7 +1270,7 @@ def _key(console_seq, vnc_key):
     if env("VM_USE_CONSOLE_BUILD"):
         _send_console(console_seq)
     else:
-        run(["vncdotool", "key", vnc_key])
+        run(["vncdotool"] + vnc_server() + ["key", vnc_key])
 
 
 def string(*args):
@@ -1270,7 +1291,17 @@ def string(*args):
     if env("VM_USE_CONSOLE_BUILD"):
         _send_console(text)
     else:
-        run(["vncdotool", "--force-caps", "type", text])
+        # --delay spaces out the synthetic keypresses (ms between events).
+        # Without it, vncdotool fires the whole string as fast as it can;
+        # under raw QEMU's VNC (faster than the old libvirt path) a slow
+        # framebuffer console -- e.g. OpenBSD bsd.rd's wscons -- drops the
+        # tail of a long string. That silently truncated the autoinstall
+        # response-file URL ("http://192.168.122.1:8000/conf/...resp" ->
+        # "http://192.168.122.1"), so the installer never fetched the resp
+        # and hung in interactive mode. The old vbox.sh already used
+        # --delay=150 for typefile; short strings only have a few chars so
+        # the added latency is negligible, long ones (URLs) now arrive intact.
+        run(["vncdotool"] + vnc_server() + ["--force-caps", "--delay=40", "type", text])
     return 0
 
 
@@ -1286,7 +1317,7 @@ def space():
     if env("VM_USE_CONSOLE_BUILD"):
         _send_console(" ")
     else:
-        run(["vncdotool", "type", " "])
+        run(["vncdotool"] + vnc_server() + ["type", " "])
     return 0
 
 
@@ -1413,7 +1444,7 @@ def inputFile(fpath=None):
         string("nc  192.168.122.1 64342 | sh")
         enter()
     else:
-        run(["vncdotool", "--force-caps", "--delay=150", "typefile", fpath])
+        run(["vncdotool"] + vnc_server() + ["--force-caps", "--delay=150", "typefile", fpath])
     return 0
 
 
