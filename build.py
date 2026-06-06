@@ -550,30 +550,52 @@ def _find_aarch64_efi_code(qemu_bin=None):
     return ""
 
 
-def _find_aarch64_efi_vars(code_src):
-    """Find the VARS template matching the given CODE firmware. anyvm.py:5272-5288.
+def _find_aarch64_efi_vars(code_src, qemu_bin=None):
+    """Find a VARS template matching the given CODE firmware.
 
-    EDK2 ships a pre-formatted NVRAM template next to the CODE blob; using a
-    blank vars region instead crashes NetBSD evbarm + (sometimes) other guests
-    with SetVariable-NVRAM-init failures that present as reboot loops at the
-    [1.000xxx] kernel mark. Try matching templates by name; return '' if none."""
+    Search CODE's own directory first (matching same-vendor pair) and then
+    fall back to **all** EFI search dirs -- on Debian/Ubuntu the
+    `qemu-efi-aarch64` package ships CODE as `/usr/share/qemu-efi-aarch64/
+    QEMU_EFI.fd` but the only working VARS template is in a different
+    directory `/usr/share/AAVMF/AAVMF_VARS.fd`; staying inside CODE's dir
+    finds nothing and we fall back to a blank vars region, which crashes
+    NetBSD evbarm + some other guests with SetVariable-NVRAM-init failures
+    that present as a tight reboot loop at the [1.000xxx] kernel mark.
+
+    A blank vars region is **always wrong on aarch64** -- if no template is
+    found anywhere we return '' and the caller logs a warning.
+    """
     if not code_src:
         return ""
-    d = os.path.dirname(code_src)
     base = os.path.basename(code_src)
-    guesses = []
-    for a, b in [("QEMU_EFI", "QEMU_VARS"), ("_CODE", "_VARS"),
-                 ("-code", "-vars"), ("CODE", "VARS")]:
-        if a in base:
-            guesses.append(os.path.join(d, base.replace(a, b)))
-    guesses += [
-        os.path.join(d, "QEMU_VARS.fd"),
-        os.path.join(d, "vars-template-pflash.raw"),
-        os.path.join(d, "AAVMF_VARS.fd"),
-    ]
-    for g in guesses:
+
+    def _name_guesses_in(d):
+        gs = []
+        # 1) Substituted-name pairs in the same directory (CODE/VARS, etc.)
+        for a, b in [("QEMU_EFI", "QEMU_VARS"), ("_CODE", "_VARS"),
+                     ("-code", "-vars"), ("CODE", "VARS")]:
+            if a in base:
+                gs.append(os.path.join(d, base.replace(a, b)))
+        # 2) Common template basenames anywhere we look.
+        gs += [
+            os.path.join(d, "QEMU_VARS.fd"),
+            os.path.join(d, "vars-template-pflash.raw"),
+            os.path.join(d, "AAVMF_VARS.fd"),
+        ]
+        return gs
+
+    # First pass: CODE's own directory (best chance of a matching pair).
+    for g in _name_guesses_in(os.path.dirname(code_src)):
         if g != code_src and os.path.exists(g):
             return g
+    # Second pass: every aarch64 EFI search directory + its known
+    # subdirectories (AAVMF, edk2/aarch64, qemu, qemu-efi-aarch64).
+    for d in _aarch64_efi_search_dirs(qemu_bin):
+        for sub in ("", "AAVMF", os.path.join("edk2", "aarch64"),
+                    "qemu", "qemu-efi-aarch64"):
+            for g in _name_guesses_in(os.path.join(d, sub)):
+                if g != code_src and os.path.exists(g):
+                    return g
     return ""
 
 
@@ -642,7 +664,7 @@ def build_qemu_args(media_kind=None, media_path=None):
             # Crucial: NetBSD evbarm + (sometimes) other aarch64 guests reboot
             # in a 3-second loop on a completely blank vars pflash because EDK2
             # cannot initialize NVRAM. Copy the matching VARS template instead.
-            vars_src = _find_aarch64_efi_vars(code_src)
+            vars_src = _find_aarch64_efi_vars(code_src, resolve_qemu_bin())
             if vars_src:
                 log("aarch64 vars template: %s" % vars_src)
                 copy_into(vars_src, varsf)
@@ -967,9 +989,24 @@ class ConsoleSession(object):
     def send(self, data):
         if isinstance(data, str):
             data = data.encode("utf-8", "replace")
+        # Emit one byte at a time with a small inter-byte delay. Raw-burst
+        # sendall() makes QEMU forward the whole string into the guest UART
+        # within microseconds, which races getty/login on slow consoles
+        # (NetBSD evbarm plcom0, OpenBSD wscons, ...) and the line discipline
+        # silently drops the tail. The 40ms cadence matches what vncdotool
+        # uses (--delay=40) and is empirically slow enough that every byte
+        # is echoed and acted on by login. Override with VM_CONSOLE_DELAY
+        # (ms) if some guest needs slower.
+        try:
+            delay = float(env("VM_CONSOLE_DELAY") or "40") / 1000.0
+        except (TypeError, ValueError):
+            delay = 0.040
         with self._send_lock:
             try:
-                self.ser.sendall(data)
+                for b in data:
+                    self.ser.sendall(bytes([b]))
+                    if delay > 0:
+                        time.sleep(delay)
             except OSError:
                 self._stop.set()
 
@@ -1913,27 +1950,49 @@ def conf_load(path):
 # ============================================================================
 
 def _ssh_ready_check(timeout=10):
-    """Return True if `ssh $VM_OS_NAME exit` succeeds within `timeout` seconds.
-    Uses subprocess.run(timeout=...) instead of the external `timeout` binary;
-    on TimeoutExpired the child is killed and we return False.
+    """Probe `ssh $VM_OS_NAME exit` with `-v` so the caller can inspect why
+    the connection failed (auth refused, no route, perm denied, banner
+    timeout). Returns (success, stderr_text). stderr_text is empty on success
+    and on TimeoutExpired (the verbose dump up to the kill point isn't useful
+    when ssh hung mid-handshake).
 
     Default 10 s -- short enough that retry polling stays snappy, long enough
     to cover SSH banner + key exchange + auth on slow guests (illumos sshd
     in particular takes 4-5 s for the full handshake even on a healthy KVM
     boot; an over-tight 2 s window misreads a working sshd as down)."""
     osname = env("VM_OS_NAME")
-    if not osname: return False
-    cmd = ["ssh",
+    if not osname:
+        return False, ""
+    # -v gives the line we actually want to see ("Permission denied
+    # (publickey)", "Connection refused", "ssh: connect to host ... port
+    # 22: No route to host"). LogLevel=ERROR would mute -v -- drop it.
+    cmd = ["ssh", "-v",
            "-o", "StrictHostKeyChecking=no",
            "-o", "UserKnownHostsFile=/dev/null",
-           "-o", "LogLevel=ERROR",
            "-o", "ConnectTimeout=%d" % max(1, int(timeout)),
            osname, "exit"]
     try:
-        return subprocess.run(cmd, stdout=DEVNULL, stderr=DEVNULL,
-                              timeout=timeout).returncode == 0
+        r = subprocess.run(cmd, stdout=DEVNULL, stderr=subprocess.PIPE,
+                           timeout=timeout)
     except subprocess.TimeoutExpired:
-        return False
+        return False, ""
+    ok = (r.returncode == 0)
+    err = "" if ok else (r.stderr or b"").decode("utf-8", "replace")
+    return ok, err
+
+
+def _ssh_verbose_summary(stderr_text, head=20, tail=10):
+    """Trim ssh -v output to the lines most likely to identify the failure.
+
+    Full -v dump per retry is too noisy (~50 lines * many retries = thousands
+    of lines in CI logs). Show the connect / handshake header and the tail
+    where the actual auth/refusal lines live."""
+    if not stderr_text:
+        return ""
+    lines = [ln for ln in stderr_text.splitlines() if ln.strip()]
+    if len(lines) <= head + tail:
+        return "\n".join(lines)
+    return "\n".join(lines[:head] + ["    ... (%d lines trimmed) ..." % (len(lines) - head - tail)] + lines[-tail:])
 
 
 def _wait_ssh(max_retries=100, restart_cb=None):
@@ -1961,8 +2020,23 @@ def _wait_ssh(max_retries=100, restart_cb=None):
     retry = 0
     restarted = False
     guard_done = False
-    while not _ssh_ready_check(10):
-        log("ssh is not ready, just wait.")
+    # Dump ssh -v output every Nth failed retry so we can see WHY ssh
+    # failed (auth denied, refused, etc.) without flooding the build log.
+    VERBOSE_EVERY = 5
+    while True:
+        ok, err = _ssh_ready_check(10)
+        if ok:
+            break
+        # First failure and every Nth retry: log the trimmed -v output so
+        # the failure reason is visible in CI logs.
+        if retry == 0 or (retry % VERBOSE_EVERY) == 0:
+            summary = _ssh_verbose_summary(err)
+            if summary:
+                log("ssh probe %d (-v summary):\n%s" % (retry, summary))
+            else:
+                log("ssh probe %d: connection timeout (no verbose output)" % retry)
+        else:
+            log("ssh is not ready, just wait.")
         if not guard_done:
             actual = detect_guest_ip(osname)
             if actual:
@@ -2066,7 +2140,13 @@ def _prep_vhd_disk(link):
 def _gen_enablessh_local():
     """Build enablessh.local: enablessh.txt + authorized_keys append (twice,
     once base64-roundtripped to dodge encoding bugs we've seen in console
-    paste paths) + chmod."""
+    paste paths) + chmod.
+
+    Final block enforces correct .ssh permissions in case the per-builder
+    enablessh.txt clobbered them (e.g. a `chmod -R 600 ~/.ssh` line that
+    leaves the *directory* at mode 600, which sshd-StrictModes refuses to
+    traverse -- causing every pubkey login to bounce to PAM and burn auth
+    attempts, ending in "maximum authentication attempts exceeded")."""
     idrsa = os.path.join(HOME, ".ssh", "id_rsa")
     if not os.path.exists(idrsa):
         run(["ssh-keygen", "-f", idrsa, "-q", "-N", ""])
@@ -2081,7 +2161,20 @@ def _gen_enablessh_local():
         b64 = base64.b64encode(pub.encode("utf-8")).decode("ascii")
         f.write("echo '%s' | openssl base64 -d >>~/.ssh/authorized_keys\n\n\n"
                 % b64)
-        f.write("\nchmod 600 ~/.ssh/authorized_keys\n\n\n")
+        # sshd StrictModes (default) requires .ssh dir 700 + authorized_keys
+        # 600. Set both explicitly -- belt-and-suspenders against a buggy
+        # `chmod -R 600` in the per-builder enablessh.txt.
+        f.write("\nchmod 700 ~/.ssh\n")
+        f.write("chmod 600 ~/.ssh/authorized_keys\n\n")
+        # Force StrictModes off so any remaining permission anomaly (parent
+        # dir mode, immutable flag, weird umask in the live image) can no
+        # longer block pubkey auth. Idempotent: only appends when the line
+        # isn't already there. The `service sshd restart` line from the
+        # per-builder enablessh.txt picks the new config up.
+        f.write("chmod u+w /etc/ssh/sshd_config 2>/dev/null || true\n")
+        f.write("grep -q '^StrictModes no' /etc/ssh/sshd_config || "
+                "echo 'StrictModes no' >> /etc/ssh/sshd_config\n")
+        f.write("chmod u-w /etc/ssh/sshd_config 2>/dev/null || true\n\n\n")
     log(open("enablessh.local").read())
 
 
@@ -2111,9 +2204,16 @@ def _enable_ssh_root_branch(sshport):
 def _enable_ssh_console_branch():
     """The console-paste path used when there's no sshd reachable yet."""
     log("login as root at console.")
+    # Two early enters to flush whatever junk getty buffered during boot, then
+    # a long pause for the kernel to drain those bytes and for getty to settle
+    # at a clean "login:" prompt. Without this pause, login on slow consoles
+    # (NetBSD evbarm plcom0) merges the trailing enters with the "root" that
+    # follows and treats the whole thing as an empty username, so "root" never
+    # echoes and never logs in.
     inputKeys("enter"); inputKeys("enter"); time.sleep(20)
-    inputKeys("enter"); inputKeys("enter")
-    inputKeys("string root; enter; sleep 5;")
+    inputKeys("enter"); inputKeys("enter"); time.sleep(5)
+    inputKeys("string root; enter")
+    time.sleep(5)
     if env("VM_ROOT_PASSWORD"):
         inputKeys("string %s ; enter" % env("VM_ROOT_PASSWORD"))
         time.sleep(10)
@@ -2304,7 +2404,10 @@ def main(argv):
     else:
         addSSHAuthorizedKeys("%s-id_rsa.pub" % output)
         startVM()
-        while not _ssh_ready_check(timeout=10):
+        while True:
+            ok, _err = _ssh_ready_check(timeout=10)
+            if ok:
+                break
             log("not ready yet, just sleep."); time.sleep(5)
         if not _send_env_check():
             return 1
