@@ -1,56 +1,41 @@
+# OmniOS r151054 / r151056 / r151058 / r151058-build unattended-install opts.
 #
-#
+# The ZFS step below sends 3 enters: ZFS pool confirm, hostname (OmniOS
+# default), continent picker (default). The continent picker auto-advances
+# on default, so by the time we wait for the next screen the installer is
+# already sitting at the "Is the above information OK?" timezone-
+# confirmation prompt. Every step here matches a screen that ACTUALLY
+# stays on screen; no fall-through-on-timeout hacks.
 
 Please select a keyboard | enter
-#Welcome to the OmniOS installer
-Welcome to |  enter
 
+#Welcome to the OmniOS installer
+Welcome to | enter
 
 Select disks using arrow keys and space bar | space; enter;
 
+# 3 enters: ZFS confirm, hostname (OmniOS default), continent picker default.
+customise aspects of the ZFS Root Pool | enter; enter; enter
+
+# TZ confirmation: screen shows "Is the above information OK?" with the
+# timezone summary above it.
+the above information | enter
+
+# Post-install: "Once back at the main menu, ... rpool now has a working
+# and mounted boot environment, per above". Stays on screen for the full
+# install duration (several minutes), then waits indefinitely for enter.
+back at the main menu | enter
+
+# Installer main menu (Welcome / Shell / Reboot / Halt). The enter selects
+# the default item, which on a finished install is Reboot -- the VM powers
+# off the install media and boots from disk into first-boot init.
+Welcome to the OmniOS installer | enter
 
 
+# --- First-boot OmniOS configuration menu (Network / SSH / etc.) ---
 
-customise aspects of the ZFS Root Pool | enter; enter;enter
+# Configure Network -> DHCP. Hot key "c" twice (Configure, then DHCP).
+onfigure | string c; enter;string c; enter; enter
 
-#OmniOS | enter
-Omni | enter
-
-
-
-
-
-#Please identify a location so that time zone rules can be set correctly
-# Continent + country may auto-skip after ZFS finishes on r151058; give it
-# a short timeout so we fall through and press enter on the TZ confirm
-# screen instead of waiting forever.
-Please select a continent | enter | 60
-
-the above information | enter | 60
-
-
-# Final pre-install summary; r151058 only flashes this very briefly. Don't
-# block the pipeline if we miss it.
-The following information has been given | enter | 30
-
-
-# Post-install reboot: OmniOS r151058 drops *back into the installed system*
-# (it auto-rebooted from disk; boot order is dc, no need to eject the ISO),
-# and first-boot init drops straight into the OmniOS configuration menu
-# (Network / SSH / Timezone / ...). Skip the obsolete "Welcome to the
-# OmniOS installer" main-menu screen and wait directly for the config menu.
-# Timeout is generous because reboot + first-boot init takes a few minutes
-# under tcg, less under kvm.
-
-# Configure network -> DHCP (hot key "c"). Doubled to ride out a transient
-# miss; second "c; enter" lands on the next sub-prompt and accepts it.
-configuration menu | string c; enter;string c; enter; enter | 600
-
-# Enable SSH server, then halt (hot keys s/s then h). build.py polls until
-# the VM powers off and proceeds to the export step.
-configuration menu | string s;string s; enter; enter;  string h; enter; sleep 10 | 600
-
-
-
-
-
+# Enable SSH, then Halt (hot keys s, s, h). build.py polls VM-down next.
+onfigure | string s;string s; enter; enter;  string h; enter; sleep 10

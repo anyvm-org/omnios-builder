@@ -1,58 +1,41 @@
+# OmniOS r151052 unattended-install opts.
 #
-#
+# The ZFS step below sends 3 enters: ZFS pool confirm, hostname (OmniOS
+# default), continent picker (default). The continent picker auto-advances
+# on default, so by the time we wait for the next screen the installer is
+# already sitting at the "Is the above information OK?" timezone-
+# confirmation prompt. Every step here matches a screen that ACTUALLY
+# stays on screen; no fall-through-on-timeout hacks.
 
 Please select a keyboard | enter
+
 #Welcome to the OmniOS installer
 Welcome to |  enter
 
-
 Select disks using arrow keys and space bar | space; enter;
 
+# 3 enters: ZFS confirm, hostname (OmniOS default), continent picker default.
+customise aspects of the ZFS Root Pool | enter; enter; enter
+
+# TZ confirmation: screen shows "Is the above information OK?" with the
+# timezone summary above it.
+the above information | enter
+
+# Post-install: "Once back at the main menu, ... rpool now has a working
+# and mounted boot environment, per above". Stays on screen for the full
+# install duration (several minutes), then waits indefinitely for enter.
+back at the main menu | enter
+
+# Installer main menu (Welcome / Shell / Reboot / Halt). The enter selects
+# the default item, which on a finished install is Reboot -- the VM powers
+# off the install media and boots from disk into first-boot init.
+Welcome to the OmniOS installer | enter
 
 
+# --- First-boot OmniOS configuration menu (Network / SSH / etc.) ---
 
-customise aspects of the ZFS Root Pool | enter; enter;enter
+# Configure Network -> DHCP. Hot key "c" twice (Configure, then DHCP).
+onfigure | string c; enter;string c; enter; enter
 
-
-OmniOS | enter
-
-
-
-
-#Please identify a location so that time zone rules can be set correctly
-# Continent + country may auto-skip after ZFS finishes on newer releases;
-# short timeouts let us fall through and press enter on the TZ confirm
-# screen instead of waiting forever.
-Please select a continent | enter | 60
-
-the above information | enter | 60
-
-
-# Final pre-install summary; newer releases flash this very briefly.
-The following information has been given | enter | 60
-
-# r151058 says "rpool now has a working and mounted boot environment" instead
-# of "Installation Complete"; match the OCR-stable bit at the bottom.
-back at the main menu | enter | 600
-
-
-
-
-#Welcome to the OmniOS installer
-
-Welcome to | enter
-
-
-
-#OmniOS configuration menu
-
-# for dhcp 
-configuration menu | string c; enter;string c; enter; enter
-
-#enable ssh server
-configuration menu | string s;string s; enter; enter;  string h; enter; sleep 10
-
-
-
-
-
+# Enable SSH, then Halt (hot keys s, s, h). build.py polls VM-down next.
+onfigure | string s;string s; enter; enter;  string h; enter; sleep 10
