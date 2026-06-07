@@ -1251,18 +1251,24 @@ def _serial_tail_line(window=4096):
     return size, last
 
 
-def _wait_vm_down(what="VM", poll=20):
+def _wait_vm_down(what="VM", poll=20, max_seconds=1800):
     """Block until isRunning() reports not-running. Every poll prints a one-
     line status: elapsed time, size of <osname>.serial.log, and the last non-
     empty line of the guest console -- so it's obvious whether the install is
-    making progress or stuck."""
+    making progress or stuck.
+
+    After max_seconds (default 1800 = 30 min) without the VM going down, we
+    force-kill the QEMU process via destroyVM() and return. This caps the
+    blast radius when a guest ignores the ACPI shutdown request -- before
+    the cap, FreeBSD 13.5 aarch64 sat at its login: prompt and burned the
+    entire 6h CI budget in this loop."""
     osname = env("VM_OS_NAME") or "vm"
     monport = read_state(osname, "monport")
     serport = read_state(osname, "serport")
     vncport = read_state(osname, "vncport") or "5900"
-    log("waiting for %s to power off (poll %ds; vnc 127.0.0.1::%s, "
+    log("waiting for %s to power off (poll %ds, max %ds; vnc 127.0.0.1::%s, "
         "monitor 127.0.0.1:%s, serial 127.0.0.1:%s -> %s.serial.log)"
-        % (what, poll, vncport, monport, serport, osname))
+        % (what, poll, max_seconds, vncport, monport, serport, osname))
     elapsed = 0
     while isRunning() == 0:
         time.sleep(poll)
@@ -1270,6 +1276,11 @@ def _wait_vm_down(what="VM", poll=20):
         size, tail = _serial_tail_line()
         mm, ss = divmod(elapsed, 60)
         log("[%dm%02ds] %s, serial=%dB | %s" % (mm, ss, what, size, tail[:140]))
+        if elapsed >= max_seconds:
+            log("%s did not power off in %d s; force-killing QEMU"
+                % (what, max_seconds))
+            destroyVM()
+            return
     log("%s powered off after %d s" % (what, elapsed))
 
 
@@ -2435,9 +2446,15 @@ def main(argv):
         # build in the same workspace (run locally, or any CI runner reused
         # by a follow-up matrix job) errors at QEMU launch with
         #   Could not set up host forwarding rule 'tcp:127.0.0.1:N-...'.
+        # Use destroyVM() (SIGTERM -> SIGKILL the QEMU pid), NOT
+        # shutdownVM()+_wait_vm_down: shutdownVM sends HMP system_powerdown
+        # which is an ACPI shutdown request, and some guests ignore it (seen
+        # on FreeBSD 13.5 aarch64 -- the verification VM stayed at the
+        # login: prompt and _wait_vm_down looped for the entire 6h CI
+        # budget). We're done with the qcow2 -- it was already exported --
+        # so a hard kill is safe.
         if isRunning() == 0:
-            shutdownVM()
-            _wait_vm_down(what="verification VM", poll=5)
+            destroyVM()
         closeConsole()
 
     log("Build finished.")
