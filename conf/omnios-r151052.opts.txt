@@ -1,11 +1,8 @@
 # OmniOS r151052 unattended-install opts.
 #
-# The ZFS step below sends 3 enters: ZFS pool confirm, hostname (OmniOS
-# default), continent picker (default). The continent picker auto-advances
-# on default, so by the time we wait for the next screen the installer is
-# already sitting at the "Is the above information OK?" timezone-
-# confirmation prompt. Every step here matches a screen that ACTUALLY
-# stays on screen; no fall-through-on-timeout hacks.
+# Every step waits for a screen that actually stays on screen long enough
+# to OCR. No fall-through-on-timeout hacks: if a screen never appears,
+# the build will deadlock here so the real cause is exposed.
 
 Please select a keyboard | enter
 
@@ -14,25 +11,35 @@ Welcome to |  enter
 
 Select disks using arrow keys and space bar | space; enter;
 
-# 3 enters: ZFS confirm, hostname (OmniOS default), continent picker default.
+# 3 enters land on the multi-field ZFS root-pool config screen, accepting
+# the rpool-name / partitioning / compression defaults. The installer then
+# advances to the timezone region picker.
 customise aspects of the ZFS Root Pool | enter; enter; enter
 
-# TZ confirmation: screen shows "Is the above information OK?" with the
-# timezone summary above it.
+# Timezone region picker ("Please identify a location ... Please select a
+# continent or ocean") -- enter accepts the highlighted default and moves
+# on to the timezone confirmation screen.
+Please select a continent | enter
+
+# Timezone confirmation: "Is the above information OK?" with the TZ summary
+# above it. Enter accepts and starts the actual install.
 the above information | enter
 
 # Post-install: "Once back at the main menu, ... rpool now has a working
-# and mounted boot environment, per above". Stays on screen for the full
-# install duration (several minutes), then waits indefinitely for enter.
+# and mounted boot environment, per above". Stays on screen for the whole
+# install duration (several minutes), then waits for enter to dismiss it
+# back to the installer main menu.
 back at the main menu | enter
 
-# Installer main menu (Welcome / Shell / Reboot / Halt). The enter selects
-# the default item, which on a finished install is Reboot -- the VM powers
-# off the install media and boots from disk into first-boot init.
+# Installer main menu (Welcome to OmniOS installer / Shell / Reboot / Halt).
+# The default item on a finished install is Reboot, so enter reboots the
+# VM into the freshly installed disk and first-boot init takes over.
 Welcome to the OmniOS installer | enter
 
 
 # --- First-boot OmniOS configuration menu (Network / SSH / etc.) ---
+# Key used as "onfigure" so the leading "C" -- prone to OCR drift -- is
+# outside the match window.
 
 # Configure Network -> DHCP. Hot key "c" twice (Configure, then DHCP).
 onfigure | string c; enter;string c; enter; enter
