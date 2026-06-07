@@ -1093,9 +1093,21 @@ def setup(install_ocr=None):
                         "tesseract-ocr", "python3-pil",
                         "tesseract-ocr-eng", "tesseract-ocr-script-latn",
                         "python3-opencv", "python3-pip"], env=apt_env)
+            # Use opencv-python-HEADLESS: the full opencv-python wheel needs
+            # libGL.so.1, which headless CI runners (GitHub Actions) lack, so
+            # `import cv2` raises ImportError there and ocr_py silently falls
+            # back to plain tesseract -- which cannot read the dim cyan dialog
+            # fields (e.g. the OmniOS hostname box). The headless wheel has the
+            # identical cv2 API with no GUI/GL dependencies.
             if _sh_quiet("pip3 install -q --break-system-packages "
-                         "pytesseract opencv-python vncdotool") != 0:
-                _sh_quiet("pip3 install -q pytesseract opencv-python vncdotool")
+                         "pytesseract opencv-python-headless vncdotool") != 0:
+                _sh_quiet("pip3 install -q pytesseract opencv-python-headless vncdotool")
+            try:
+                import cv2  # noqa: F401
+                log("setup: cv2 import OK -- cyan-field OCR pass enabled")
+            except Exception as e:
+                log("setup: cv2 import FAILED (%s) -- OCR falls back to plain "
+                    "tesseract, cyan-field recovery DISABLED" % e)
             vp = os.path.join(HOME, ".local", "bin", "vncdotool")
             if os.path.exists(vp):
                 _run_quiet(["sudo", "ln", "-sf", vp, "/usr/local/bin/vncdotool"])
@@ -1136,7 +1148,7 @@ def setup(install_ocr=None):
                     "KVM unavailable, falling back to TCG." % e)
     else:
         _run_quiet(["brew", "install", "tesseract", "qemu"])
-        _sh_quiet("pip3 install -q pytesseract opencv-python vncdotool")
+        _sh_quiet("pip3 install -q pytesseract opencv-python-headless vncdotool")
         log("Reloading sshd services in the Host")
         _sh_quiet('sudo sh -c \'echo "" >>/etc/ssh/sshd_config; '
                   'echo "StrictModes no" >>/etc/ssh/sshd_config\'')
@@ -1340,20 +1352,26 @@ def ocr_py(img):
     # pass above drops. The OmniOS/illumos installer draws input-field values
     # (e.g. the "Enter the system hostname" box's "omnios") in cyan, which sits
     # below the OTSU threshold, so the primary pass sees only the bright banner
-    # and the field can never be matched. The cyan channel min(G,B)-R isolates
-    # that text; on screens with no cyan it yields nothing, so this only ADDS
-    # field values and never perturbs an existing match. cv2.imread gives BGR,
-    # so split() returns (B, G, R) -- use those channels directly.
-    try:
-        b_ch, g_ch, r_ch = cv2.split(im)
-        cyan = cv2.subtract(cv2.min(g_ch, b_ch), r_ch)
-        cyan = cv2.resize(cyan, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-        _, cyan = cv2.threshold(cyan, 25, 255, cv2.THRESH_BINARY)
-        ctext = pytesseract.image_to_string(cyan).strip()
-        if ctext:
-            text = text + "\n" + ctext
-    except Exception:
-        pass
+    # and the field can never be matched. Only attempt it when the primary pass
+    # is "banner-only" (the dialog OCRs to just the banner, ~18 chars); richer
+    # screens never need it, so this skips the cost and avoids any cyan noise.
+    # cv2.imread gives BGR, so split() returns (B, G, R); cyan = min(G,B)-R
+    # isolates the field text and is ~0 on yellow borders / the white banner.
+    # Try several thresholds (strict -> loose) so it survives brightness
+    # differences between the local capture and the CI runner's capture.
+    if len(text.strip()) < 40:
+        try:
+            b_ch, g_ch, r_ch = cv2.split(im)
+            cyan = cv2.subtract(cv2.min(g_ch, b_ch), r_ch)
+            cyan = cv2.resize(cyan, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+            for th in (25, 16, 8):
+                _, cb = cv2.threshold(cyan, th, 255, cv2.THRESH_BINARY)
+                ctext = pytesseract.image_to_string(cb).strip()
+                if ctext:
+                    text = text + "\n" + ctext
+                    break
+        except Exception:
+            pass
     return text
 
 
