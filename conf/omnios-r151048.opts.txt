@@ -15,26 +15,27 @@ Continue | enter; sleep 3; enter
 
 
 #Please identify a location so that time zone rules can be set correctly
-
-location  | enter
+# Old-release installers may auto-skip some prompts; short timeouts let us
+# fall through and press enter on whatever screen is actually visible.
+location  | enter | 60
 
 
 #Is the above information OK
-information | enter
+information | enter | 60
 
 
-Installation Complete | enter
+Installation Complete | enter | 600
 
 
-Welcome to | enter
+Welcome to | enter | 600
 
 
 
 
-OmniOS configuration menu | string c; enter;string c; enter; enter
+OmniOS configuration menu | string c; enter;string c; enter; enter | 600
 
 
-OmniOS configuration menu | string s; string s; enter; enter; string h; enter; sleep 10
+OmniOS configuration menu | string s; string s; enter; enter; string h; enter; sleep 10 | 600
 
 
 
