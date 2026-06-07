@@ -12,15 +12,18 @@ Welcome to | enter
 Select disks using arrow keys and space bar | space; enter;
 
 # 3 enters land on the multi-field ZFS root-pool config screen, accepting
-# the rpool-name / partitioning / compression defaults. The installer then
-# advances to the timezone region picker.
+# the rpool-name / partitioning / compression defaults, then "Continue with
+# the installation". The installer advances straight to the timezone region
+# picker, which stays on screen for the next step to match.
 customise aspects of the ZFS Root Pool | enter; enter; enter
 
-
-
-#hostname
-OmniOS | enter
-
+# Do NOT add an "OmniOS | enter" step here. The "OmniOS v11 r151058" banner
+# is drawn at the top of EVERY installer screen, so waitForText("OmniOS")
+# matches whatever screen is up when the step runs -- a race. In CI it fired
+# on the continent picker, consumed the continent selection, and desynced
+# every later step (build hung forever at "Is the above information OK?").
+# There is no separate hostname prompt in this installer; the hostname is set
+# at the very end by the "string h" config-menu step below.
 
 # Timezone region picker ("Please identify a location ... Please select a
 # continent or ocean") -- enter accepts the highlighted default and moves
