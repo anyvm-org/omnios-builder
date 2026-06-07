@@ -1357,19 +1357,30 @@ def ocr_py(img):
     # screens never need it, so this skips the cost and avoids any cyan noise.
     # cv2.imread gives BGR, so split() returns (B, G, R); cyan = min(G,B)-R
     # isolates the field text and is ~0 on yellow borders / the white banner.
-    # Try several thresholds (strict -> loose) so it survives brightness
-    # differences between the local capture and the CI runner's capture.
+    # Crop to the cyan content's bounding box, then OCR with --psm 7 (treat as
+    # a single text line). Upscaling the whole frame to 3200x2400 and OCRing it
+    # with tesseract's default PSM 3 (auto page layout) finds the lone cyan word
+    # on tesseract 5.x but FAILS on the older tesseract the CI runner ships --
+    # so the field read empty in CI even though the captured pixels were
+    # identical to local. Cropping to the cyan bbox yields a small, dense,
+    # single-line image and --psm 7 skips the version-dependent layout analysis,
+    # so it reads the same on every tesseract version.
     if len(text.strip()) < 40:
         try:
             b_ch, g_ch, r_ch = cv2.split(im)
             cyan = cv2.subtract(cv2.min(g_ch, b_ch), r_ch)
-            cyan = cv2.resize(cyan, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-            for th in (25, 16, 8):
-                _, cb = cv2.threshold(cyan, th, 255, cv2.THRESH_BINARY)
-                ctext = pytesseract.image_to_string(cb).strip()
+            _, mask = cv2.threshold(cyan, 16, 255, cv2.THRESH_BINARY)
+            ys, xs = numpy.where(mask > 0)
+            if len(xs) >= 5:
+                pad = 8
+                y0 = max(0, int(ys.min()) - pad); y1 = int(ys.max()) + pad
+                x0 = max(0, int(xs.min()) - pad); x1 = int(xs.max()) + pad
+                crop = cyan[y0:y1, x0:x1]
+                crop = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+                _, crop = cv2.threshold(crop, 16, 255, cv2.THRESH_BINARY)
+                ctext = pytesseract.image_to_string(crop, config="--psm 7").strip()
                 if ctext:
                     text = text + "\n" + ctext
-                    break
         except Exception:
             pass
     return text
