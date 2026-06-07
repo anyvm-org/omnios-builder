@@ -11,19 +11,20 @@ Welcome to |  enter
 
 Select disks using arrow keys and space bar | space; enter;
 
-# 3 enters land on the multi-field ZFS root-pool config screen, accepting
-# the rpool-name / partitioning / compression defaults, then "Continue with
-# the installation". The installer advances straight to the timezone region
-# picker, which stays on screen for the next step to match.
-customise aspects of the ZFS Root Pool | enter; enter; enter
+# ZFS root-pool config screen: ">>> Continue <<<" is preselected at the top,
+# so ONE enter accepts the recommended rpool-name / partitioning / compression
+# defaults and proceeds to the hostname dialog.
+customise aspects of the ZFS Root Pool | enter
 
-# Do NOT add an "OmniOS | enter" step here. The "OmniOS v11 r151052" banner
-# is drawn at the top of EVERY installer screen, so waitForText("OmniOS")
-# matches whatever screen is up when the step runs -- a race. In CI it fired
-# on the continent picker, consumed the continent selection, and desynced
-# every later step (build hung forever at "Is the above information OK?").
-# There is no separate hostname prompt in this installer; the hostname is set
-# at the very end by the "string h" config-menu step below.
+# "Enter the system hostname" dialog -- text field pre-filled "omnios", <OK>
+# preselected. The dialog TITLE is dim yellow and falls below the grayscale
+# OTSU threshold, so OCR reads only the bright "OmniOS" banner -- which is why
+# the old opts matched "OmniOS" (the sole OCR-able text here) and raced, since
+# that banner is on every screen. The field value "omnios" (lowercase) is in
+# brighter cyan; ocr_py's cyan pass recovers it and it is unique to this dialog
+# during install, so wait for "omnios" and press enter to accept <OK>. One
+# enter per screen -- no blind enters, no timing race.
+omnios | enter
 
 # Timezone region picker ("Please identify a location ... Please select a
 # continent or ocean") -- enter accepts the highlighted default and moves
