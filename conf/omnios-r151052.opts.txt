@@ -9,22 +9,24 @@ Please select a keyboard | enter
 #Welcome to the OmniOS installer
 Welcome to |  enter
 
-Select disks using arrow keys and space bar | space; enter;
+# Disk-select screen. PaddleOCR splits the heading into "Select" and "disks
+# using arrow keys and space bar" as separate lines, so match the part that
+# stays on one line. space selects the only disk (c4t0d0), enter proceeds.
+disks using arrow keys and space bar | space; enter;
 
 # ZFS root-pool config screen: ">>> Continue <<<" is preselected at the top,
 # so ONE enter accepts the recommended rpool-name / partitioning / compression
-# defaults and proceeds to the hostname dialog.
-customise aspects of the ZFS Root Pool | enter
+# defaults and proceeds to the hostname dialog. PaddleOCR reads the title's
+# "ZFS" as "ZFs", so match the case-stable prefix "customise aspects of the".
+customise aspects of the | enter
 
-# "Enter the system hostname" dialog -- text field pre-filled "omnios", <OK>
-# preselected. The dialog TITLE is dim yellow and falls below the grayscale
-# OTSU threshold, so OCR reads only the bright "OmniOS" banner -- which is why
-# the old opts matched "OmniOS" (the sole OCR-able text here) and raced, since
-# that banner is on every screen. The field value "omnios" (lowercase) is in
-# brighter cyan; ocr_py's cyan pass recovers it and it is unique to this dialog
-# during install, so wait for "omnios" and press enter to accept <OK>. One
-# enter per screen -- no blind enters, no timing race.
-omnios | enter
+# "Enter the system hostname" dialog (text field pre-filled "omnios", <OK>
+# preselected). With VM_OCR=paddle, PaddleOCR's neural recognizer reads this
+# dim dialog title cleanly, so wait for "system hostname" and press enter to
+# accept <OK>. (tesseract saw only the bright "OmniOS" banner here -- and that
+# banner is on every screen, so matching it raced; PaddleOCR removes the need
+# for any banner / colour-channel trick.)
+system hostname | enter
 
 # Timezone region picker ("Please identify a location ... Please select a
 # continent or ocean") -- enter accepts the highlighted default and moves
@@ -35,16 +37,19 @@ Please select a continent | enter
 # above it. Enter accepts and starts the actual install.
 the above information | enter
 
-# Post-install: "Once back at the main menu, ... rpool now has a working
-# and mounted boot environment, per above". Stays on screen for the whole
-# install duration (several minutes), then waits for enter to dismiss it
-# back to the installer main menu.
-back at the main menu | enter
+# Post-install "Installation Complete" screen ("rpool now has a working and
+# mounted boot environment ..."). Stays up for the whole install (minutes).
+# PaddleOCR fragments the "Once back at the main menu ..." sentence word by
+# word, so match the contiguous line "now has a working and mounted boot".
+# Enter dismisses it to the installer main menu.
+now has a working and mounted boot | enter
 
-# Installer main menu (Welcome to OmniOS installer / Shell / Reboot / Halt).
-# The default item on a finished install is Reboot, so enter reboots the
-# VM into the freshly installed disk and first-boot init takes over.
-Welcome to the OmniOS installer | enter
+# Installer main menu. Its default highlighted item is "Configure the
+# installed OmniOS system", so enter opens the first-boot configuration menu
+# (Network / SSH / etc.) -- it does NOT reboot. Match "Configure the
+# installed", which is unique to this menu and free of the OmniOS/Omnios case
+# drift PaddleOCR shows in the banner/title.
+Configure the installed | enter
 
 
 # --- First-boot OmniOS configuration menu (Network / SSH / etc.) ---
