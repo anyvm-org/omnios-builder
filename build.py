@@ -2066,11 +2066,15 @@ def _wait_ssh(max_retries=100, restart_cb=None):
 
 def start_and_wait():
     osname = _check_osname("start_and_wait")
-    if not osname: return
-    startVM(); time.sleep(2); openConsole()
+    if not osname: return 1
+    if startVM() != 0:
+        log("start_and_wait: startVM failed for %s, aborting" % osname)
+        return 1
+    time.sleep(2); openConsole()
     if not run_hook("waitForLoginTag"):
         waitForText(env("VM_LOGIN_TAG"))
     time.sleep(3)
+    return 0
 
 
 def shutdown_and_wait():
@@ -2290,7 +2294,9 @@ def main(argv):
         log("vm does not exist (ok)")
 
     if env("VM_ISO_LINK"):
-        createVM(env("VM_ISO_LINK"), ostype, sshport, env("VM_PRE_DISK_LINK"))
+        if createVM(env("VM_ISO_LINK"), ostype, sshport, env("VM_PRE_DISK_LINK")) != 0:
+            log("createVM failed; aborting")
+            return 1
         time.sleep(2)
         openConsole()
         if not run_hook("installOpts"):
@@ -2403,7 +2409,9 @@ def main(argv):
         log("skip")
     else:
         addSSHAuthorizedKeys("%s-id_rsa.pub" % output)
-        startVM()
+        if startVM() != 0:
+            log("verification startVM failed; aborting")
+            return 1
         while True:
             ok, _err = _ssh_ready_check(timeout=10)
             if ok:
@@ -2421,6 +2429,16 @@ def main(argv):
             subprocess.call(["ssh", osname, "ls -lah $HOME"])
             log("======Show ssh config: ")
             subprocess.call(["ssh", osname, "cat /etc/ssh/sshd_config"])
+
+        # Tear down the verification VM so its QEMU process doesn't outlive
+        # this build. Otherwise its hostfwd holds VM_SSH_PORT and the next
+        # build in the same workspace (run locally, or any CI runner reused
+        # by a follow-up matrix job) errors at QEMU launch with
+        #   Could not set up host forwarding rule 'tcp:127.0.0.1:N-...'.
+        if isRunning() == 0:
+            shutdownVM()
+            _wait_vm_down(what="verification VM", poll=5)
+        closeConsole()
 
     log("Build finished.")
     return 0
