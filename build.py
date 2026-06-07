@@ -539,12 +539,22 @@ def _aarch64_efi_search_dirs(qemu_bin=None):
 
 
 # Relative paths under each search dir where aarch64 EDK2 CODE firmware lives.
-# Mirrors anyvm.py:5232-5238 verbatim (anyvm.py's arm64 path is validated).
+# anyvm.py:5232-5238 lists the MERGED QEMU_EFI.fd first, and that is fine for
+# its use case (RUNNING a finished image: the installed kernel never calls UEFI
+# runtime services, so a CODE/VARS build mismatch is harmless). But we INSTALL
+# from bsd.rd, whose installer kernel DOES call EFI runtime services -- with a
+# merged CODE paired against AAVMF_VARS.fd (the only VARS the merged image can
+# fall back to, from a different EDK2 build) the NVRAM/runtime layer desyncs and
+# bsd.rd resets in a boot loop the moment it jumps to the kernel (reproduced on
+# CI: bsd.rd loads, VM resets, forever). So prefer SPLIT firmware whose VARS
+# companion sits in the same dir / same build (edk2-aarch64-code.fd ->
+# edk2-aarch64-vars.fd, AAVMF_CODE.fd -> AAVMF_VARS.fd); keep merged images only
+# as last-resort fallbacks.
 _AARCH64_EFI_CODE_RELNAMES = [
-    os.path.join("edk2", "aarch64", "QEMU_EFI.fd"),
-    os.path.join("qemu-efi-aarch64", "QEMU_EFI.fd"),
-    os.path.join("AAVMF", "AAVMF_CODE.fd"),
-    os.path.join("qemu", "edk2-aarch64-code.fd"),
+    os.path.join("qemu", "edk2-aarch64-code.fd"),       # -> edk2-aarch64-vars.fd
+    os.path.join("AAVMF", "AAVMF_CODE.fd"),             # -> AAVMF_VARS.fd
+    os.path.join("edk2", "aarch64", "QEMU_EFI.fd"),     # merged (fallback)
+    os.path.join("qemu-efi-aarch64", "QEMU_EFI.fd"),    # merged (fallback)
     os.path.join("edk2", "aarch64", "QEMU_EFI-pflash.raw"),
 ]
 
@@ -767,25 +777,42 @@ def build_qemu_args(media_kind=None, media_path=None):
         if accel == "kvm":
             a += ["-global", "kvm-pit.lost_tick_policy=delay"]
         a += ["-device", "%s,netdev=net0" % nic, "-device", "virtio-balloon-pci"]
-        # Pin the install CDROM (when present) to IDE primary master,
-        # matching the libvirt-era release XML (`<target dev='hda' bus='ide'/>`).
-        # That makes the guest see it as cd0a -- NetBSD sysinst's default
-        # mount path. QEMU's `-cdrom` shortcut puts it at IDE index=2
-        # (secondary master = cd1a), which NetBSD then fails to mount and
-        # falls into the "Distribution medium" menu loop.
-        # When the main disk is also on IDE (dragonflybsd / ghostbsd:
-        # VM_DISK=ide), shift it to secondary master to avoid colliding
-        # with the cdrom slot.
+        # CDROM / disk IDE-slot placement -- two layouts depending on whether
+        # the main disk itself sits on the IDE bus.
+        #
+        #  * Disk NOT on IDE (e.g. NetBSD, which has no VM_DISK and so defaults
+        #    to virtio). Pin the install CDROM to IDE primary master (index=0),
+        #    matching the libvirt-era release XML (`<target dev='hda'
+        #    bus='ide'/>`) so the guest sees it as cd0a -- NetBSD sysinst's
+        #    default mount path. QEMU's `-cdrom` shortcut would instead land it
+        #    at index=2 (cd1a), which NetBSD fails to mount, looping in the
+        #    "Distribution medium" menu. The virtio disk never shares the IDE
+        #    bus, so this cannot disturb the disk's identity.
+        #
+        #  * Disk ON IDE (dragonflybsd / ghostbsd: VM_DISK=ide). The disk MUST
+        #    stay on IDE primary master (index=0) so QEMU hands it the lowest
+        #    auto serial (QM00001) in BOTH the install run (CDROM present) and
+        #    the startVM reboot (CDROM gone). QEMU assigns `QM%05d` serials in
+        #    IDE init order (index 0,1,2,3), independent of disk-vs-cdrom. If
+        #    the CDROM stole index=0 the disk would be QM00003 during install
+        #    but QM00001 on reboot, so DragonFly's recorded root device
+        #    `serno/QM00003` would vanish -> "Root mount failed: 6" hang at
+        #    mountroot>. So here the CDROM goes on secondary master via the
+        #    `-cdrom` shortcut (index=2) and the disk keeps index=0.
+        ide_disk = (dif == "ide")
         if dif == "sata":
             a += ["-drive", "file=%s,format=qcow2,if=none,id=disk0,discard=unmap,detect-zeroes=unmap" % qcow]
             a += ["-device", "ich9-ahci,id=ahci0", "-device", "ide-hd,bus=ahci0.0,drive=disk0"]
-        elif dif == "ide" and media_kind == "cdrom":
-            a += ["-drive", "file=%s,format=qcow2,if=ide,index=2,discard=unmap,detect-zeroes=unmap" % qcow]
         else:
             a += ["-drive", "file=%s,format=qcow2,if=%s,discard=unmap,detect-zeroes=unmap" % (qcow, dif)]
         if media_kind == "cdrom":
-            a += ["-drive", "file=%s,format=raw,if=ide,index=0,media=cdrom" % media_path,
-                  "-boot", "order=dc,menu=off"]
+            if ide_disk:
+                # IDE disk already holds index=0; CDROM goes to secondary
+                # master (index=2) so the disk keeps its stable serial.
+                a += ["-cdrom", media_path, "-boot", "order=dc,menu=off"]
+            else:
+                a += ["-drive", "file=%s,format=raw,if=ide,index=0,media=cdrom" % media_path,
+                      "-boot", "order=dc,menu=off"]
         elif media_kind == "disk":
             a += ["-drive", "file=%s,format=raw,if=ide" % media_path]
         # VGA device, anyvm.py:5441-5444. NetBSD/Haiku -> std,
@@ -1093,21 +1120,30 @@ def setup(install_ocr=None):
                         "tesseract-ocr", "python3-pil",
                         "tesseract-ocr-eng", "tesseract-ocr-script-latn",
                         "python3-opencv", "python3-pip"], env=apt_env)
-            # Use opencv-python-HEADLESS: the full opencv-python wheel needs
-            # libGL.so.1, which headless CI runners (GitHub Actions) lack, so
-            # `import cv2` raises ImportError there and ocr_py silently falls
-            # back to plain tesseract -- which cannot read the dim cyan dialog
-            # fields (e.g. the OmniOS hostname box). The headless wheel has the
-            # identical cv2 API with no GUI/GL dependencies.
+            # Use opencv-python-HEADLESS, not the full opencv-python wheel: the
+            # full wheel needs libGL.so.1, which headless CI runners (GitHub
+            # Actions) lack, so `import cv2` raises ImportError there. cv2 is
+            # used by ocr_py and transitively by paddleocr, so a clean import
+            # matters either way.
             if _sh_quiet("pip3 install -q --break-system-packages "
                          "pytesseract opencv-python-headless vncdotool") != 0:
                 _sh_quiet("pip3 install -q pytesseract opencv-python-headless vncdotool")
-            try:
-                import cv2  # noqa: F401
-                log("setup: cv2 import OK -- cyan-field OCR pass enabled")
-            except Exception as e:
-                log("setup: cv2 import FAILED (%s) -- OCR falls back to plain "
-                    "tesseract, cyan-field recovery DISABLED" % e)
+            if env("VM_OCR") == "paddle":
+                # Neural OCR (see ocr_paddle) for installer dialogs whose dim /
+                # low-contrast text tesseract cannot read. Install the engine,
+                # then warm it once so the PP-OCRv5 mobile models download here
+                # during setup rather than stalling the first waitForText poll.
+                if _sh_quiet("pip3 install -q --break-system-packages "
+                             "paddlepaddle paddleocr") != 0:
+                    _sh_quiet("pip3 install -q paddlepaddle paddleocr")
+                try:
+                    import cv2, numpy
+                    cv2.imwrite("/tmp/_paddle_warm.png",
+                                numpy.full((60, 200, 3), 255, numpy.uint8))
+                    ocr_paddle("/tmp/_paddle_warm.png")
+                    log("setup: PaddleOCR ready (models cached)")
+                except Exception as e:
+                    log("setup: PaddleOCR warm-up failed (%s)" % e)
             vp = os.path.join(HOME, ".local", "bin", "vncdotool")
             if os.path.exists(vp):
                 _run_quiet(["sudo", "ln", "-sf", vp, "/usr/local/bin/vncdotool"])
@@ -1347,47 +1383,53 @@ def ocr_py(img):
     kernel = numpy.ones((2, 1), numpy.uint8)
     im2 = cv2.erode(gray, kernel, iterations=1)
     im2 = cv2.dilate(im2, kernel, iterations=1)
-    text = pytesseract.image_to_string(im2)
-    # Second pass: recover dim CYAN dialog-field text that the grayscale OTSU
-    # pass above drops. The OmniOS/illumos installer draws input-field values
-    # (e.g. the "Enter the system hostname" box's "omnios") in cyan, which sits
-    # below the OTSU threshold, so the primary pass sees only the bright banner
-    # and the field can never be matched. Only attempt it when the primary pass
-    # is "banner-only" (the dialog OCRs to just the banner, ~18 chars); richer
-    # screens never need it, so this skips the cost and avoids any cyan noise.
-    # cv2.imread gives BGR, so split() returns (B, G, R); cyan = min(G,B)-R
-    # isolates the field text and is ~0 on yellow borders / the white banner.
-    # Crop to the cyan content's bounding box, then OCR with --psm 7 (treat as
-    # a single text line). Upscaling the whole frame to 3200x2400 and OCRing it
-    # with tesseract's default PSM 3 (auto page layout) finds the lone cyan word
-    # on tesseract 5.x but FAILS on the older tesseract the CI runner ships --
-    # so the field read empty in CI even though the captured pixels were
-    # identical to local. Cropping to the cyan bbox yields a small, dense,
-    # single-line image and --psm 7 skips the version-dependent layout analysis,
-    # so it reads the same on every tesseract version.
-    if len(text.strip()) < 40:
-        try:
-            b_ch, g_ch, r_ch = cv2.split(im)
-            cyan = cv2.subtract(cv2.min(g_ch, b_ch), r_ch)
-            _, mask = cv2.threshold(cyan, 16, 255, cv2.THRESH_BINARY)
-            ys, xs = numpy.where(mask > 0)
-            if len(xs) >= 5:
-                pad = 8
-                y0 = max(0, int(ys.min()) - pad); y1 = int(ys.max()) + pad
-                x0 = max(0, int(xs.min()) - pad); x1 = int(xs.max()) + pad
-                crop = cyan[y0:y1, x0:x1]
-                crop = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-                _, crop = cv2.threshold(crop, 16, 255, cv2.THRESH_BINARY)
-                ctext = pytesseract.image_to_string(crop, config="--psm 7").strip()
-                if ctext:
-                    text = text + "\n" + ctext
-        except Exception:
-            pass
-    return text
+    return pytesseract.image_to_string(im2)
+
+
+_PADDLE_OCR = None
+
+
+def ocr_paddle(img):
+    """OCR via PaddleOCR (PP-OCRv5 mobile det + en mobile rec). Used when a
+    conf sets VM_OCR=paddle. PaddleOCR's neural recognizer reads dim / low-
+    contrast installer dialog text that tesseract drops entirely (e.g. the
+    OmniOS "Enter the system hostname" box), so no per-screen colour tricks
+    are needed. The engine is built once and reused. enable_mkldnn=False
+    avoids a paddlepaddle 3.x oneDNN/PIR crash; the doc-orientation / unwarp /
+    textline-orientation sub-models are disabled (a flat console screen needs
+    none) to keep each predict near ~1s. Falls back to tesseract on any
+    error / if PaddleOCR is not installed."""
+    global _PADDLE_OCR
+    try:
+        if _PADDLE_OCR is None:
+            # Cap CPU: paddlepaddle otherwise spins ~6 OpenMP threads per
+            # predict, which on a 2-4 vCPU CI runner saturates the box and
+            # starves the KVM guest's boot / sshd. cpu_threads=2 plus
+            # OMP_NUM_THREADS keep each predict near ~1s while staying in budget.
+            os.environ.setdefault("OMP_NUM_THREADS", "2")
+            from paddleocr import PaddleOCR
+            _PADDLE_OCR = PaddleOCR(
+                lang="en", enable_mkldnn=False, cpu_threads=2,
+                text_detection_model_name="PP-OCRv5_mobile_det",
+                text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False)
+        lines = []
+        for r in _PADDLE_OCR.predict(img):
+            try: lines.extend(r["rec_texts"])
+            except Exception: pass
+        return "\n".join(lines)
+    except Exception as e:
+        log("ocr_paddle failed (%s); falling back to tesseract" % e)
+        return ocr_tess(img)
 
 
 def ocr(img):
-    if env("VM_OCR") == "py":
+    mode = env("VM_OCR")
+    if mode == "paddle":
+        return ocr_paddle(img)
+    if mode == "py":
         return ocr_py(img)
     return ocr_tess(img)
 
