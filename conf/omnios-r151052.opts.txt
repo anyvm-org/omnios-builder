@@ -16,6 +16,10 @@ Select disks using arrow keys and space bar | space; enter;
 # advances to the timezone region picker.
 customise aspects of the ZFS Root Pool | enter; enter; enter
 
+#hostname
+OmniOS | enter
+
+
 # Timezone region picker ("Please identify a location ... Please select a
 # continent or ocean") -- enter accepts the highlighted default and moves
 # on to the timezone confirmation screen.
