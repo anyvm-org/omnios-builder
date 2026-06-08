@@ -1707,26 +1707,45 @@ def addNAT(proto=None, hostPort=None, vmPort=None):
     return 0
 
 
-def exportOVA(ova=None, xml=None):
+def exportOVA(ova=None, qemu_args=None):
     osname = _check_osname("exportOVA")
     if not osname: return 1
     if not ova:
-        log("Usage: exportOVA out.qcow2 [out.xml]"); return 1
+        log("Usage: exportOVA out.qcow2 [out.qemu]"); return 1
     src = "%s.qcow2" % osname
     log(src)
-    run(["qemu-img", "convert", "-O", "qcow2", "-o", "preallocation=off", src, ova])
+    # Stage 1: qemu-img convert the work disk into a fresh, compacted /
+    # sparsified qcow2 at the release path. qemu-img refuses to use the same
+    # file as both input and output, so we write to `ova` and swap below.
+    # Peak disk during this step: src + ova (~2x the qcow2 size, briefly).
+    run(["qemu-img", "convert", "-O", "qcow2", "-S", "4k",
+         "-o", "preallocation=off", src, ova])
+    # Stage 2: drop the original work disk and move the converted one into
+    # its place. After this we hold a single qcow2 file (~1x), and the
+    # downstream verification VM (started later in main()) still boots from
+    # the same `<osname>.qcow2` path it always did. Without this swap, zstd
+    # below runs with src + ova + the growing .zst chunks all on disk
+    # simultaneously (~2.25x peak), which trips the runner's free-space
+    # margin for the bigger images.
+    try: os.remove(src)
+    except OSError: pass
+    os.rename(ova, src)
+    # Stage 3: stream-compress the single remaining qcow2 to the release
+    # `<output>.qcow2.zst[.N]`. split keeps any future >2GB build's chunks
+    # under GitHub's release-asset size cap; single-chunk case renames
+    # .zst.0 -> .zst so consumers just `zstd -d` the one file.
     sh("zstd -c %s | split -b 2000M -d -a 1 - %s"
-       % (shlex.quote(ova), shlex.quote(ova + ".zst.")))
+       % (shlex.quote(src), shlex.quote(ova + ".zst.")))
     run(["ls", "-lah"])
     try: os.rename(ova + ".zst.0", ova + ".zst")
     except OSError: pass
     sh("chmod +r %s* 2>/dev/null || true" % shlex.quote(ova + ".zst"))
-    if xml:
+    if qemu_args:
         cl = state(osname, "cmdline")
         if os.path.exists(cl):
-            shutil.copy(cl, xml)
+            shutil.copy(cl, qemu_args)
         else:
-            with open(xml, "w") as f:
+            with open(qemu_args, "w") as f:
                 f.write("# no launch descriptor recorded for %s\n" % osname)
     return 0
 
@@ -2543,9 +2562,9 @@ def main(argv):
     log("free space:"); sh("df -h")
 
     ova = "%s.qcow2" % output
-    xml = "%s.xml" % output
+    qemu_args = "%s.qemu" % output
     log("Exporting %s" % ova)
-    exportOVA(ova, xml)
+    exportOVA(ova, qemu_args)
 
     shutil.copy(os.path.join(HOME, ".ssh", "id_rsa"), "%s-host.id_rsa" % output)
     log("contents after export:"); sh("ls -lah")

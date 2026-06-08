@@ -59,6 +59,27 @@ jobs:
         port: 8000
     - run: |
         python3 build.py conf/omnios-${{ matrix.os }}.conf
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        # One artifact per matrix job, so they don't collide and each can be
+        # downloaded independently from the run page.
+        name: omnios-${{ matrix.os }}
+        path: |
+          omnios-${{ matrix.os }}.qcow2.zst*
+          omnios-${{ matrix.os }}-id_rsa.pub
+          omnios-${{ matrix.os }}-host.id_rsa
+          omnios-${{ matrix.os }}.qemu
+        if-no-files-found: warn
+        # qcow2.zst is already maximally compressed; gzip-recompressing the
+        # bundle just burns CPU for ~0 savings.
+        compression-level: 0
+        # Auto-expire to keep the repo's artifact storage quota from growing
+        # unboundedly. Two days is enough for a human to grab a copy for
+        # local verification; anything that needs to persist longer should
+        # cut a release (which goes through the Upload Release Asset step
+        # below and lives forever).
+        retention-days: 2
     - name: Upload Release Asset
       if: "contains(github.ref, 'refs/tags/')"
       id: upload-release-asset
@@ -70,6 +91,6 @@ jobs:
           omnios-${{ matrix.os }}.qcow2.zst*
           omnios-${{ matrix.os }}-id_rsa.pub
           omnios-${{ matrix.os }}-host.id_rsa
-          omnios-${{ matrix.os }}.xml
+          omnios-${{ matrix.os }}.qemu
 
 
