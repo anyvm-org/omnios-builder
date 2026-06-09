@@ -1667,9 +1667,22 @@ def addSSHHost(idfile=None, user=None):
     sshport = read_state(osname, "sshport") or "22"
     sshdir = os.path.join(HOME, ".ssh")
     os.makedirs(sshdir, exist_ok=True)
-    with open(os.path.join(sshdir, "config"), "a") as f:
-        f.write("\nInclude config.d/*\nStrictHostKeyChecking=accept-new\n"
-                "SendEnv   CI  GITHUB_*\n\n")
+    # Only append if the marker line isn't already present. Without this guard
+    # every rebuild duplicates the block, and after enough runs OpenSSH stops
+    # honoring SendEnv (more importantly: dozens of redundant `Include` lines
+    # confuse downstream parsing). Each builder rewrites its own per-osname
+    # block under config.d/ below anyway, so the global block only needs to
+    # exist once.
+    sshconfig = os.path.join(sshdir, "config")
+    marker = "SendEnv   CI  GITHUB_*"
+    existing = ""
+    if os.path.exists(sshconfig):
+        with open(sshconfig) as f:
+            existing = f.read()
+    if marker not in existing:
+        with open(sshconfig, "a") as f:
+            f.write("\nInclude config.d/*\nStrictHostKeyChecking=accept-new\n"
+                    "SendEnv   CI  GITHUB_*\n\n")
     os.makedirs(os.path.join(sshdir, "config.d"), exist_ok=True)
     conf = ("\nHost %s\n  User %s\n  HostName 127.0.0.1\n  Port %s\n"
             "  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n"
@@ -2114,7 +2127,7 @@ def conf_load(path):
 # (M) Build pipeline (was build.sh)
 # ============================================================================
 
-def _ssh_ready_check(timeout=10):
+def _ssh_ready_check(timeout=None):
     """Probe `ssh $VM_OS_NAME exit` with `-v` so the caller can inspect why
     the connection failed (auth refused, no route, perm denied, banner
     timeout). Returns (success, stderr_text). stderr_text is empty on success
@@ -2124,10 +2137,19 @@ def _ssh_ready_check(timeout=10):
     Default 10 s -- short enough that retry polling stays snappy, long enough
     to cover SSH banner + key exchange + auth on slow guests (illumos sshd
     in particular takes 4-5 s for the full handshake even on a healthy KVM
-    boot; an over-tight 2 s window misreads a working sshd as down)."""
+    boot; an over-tight 2 s window misreads a working sshd as down). Override
+    with $VM_SSH_READY_TIMEOUT when the guest needs longer -- e.g. Ubuntu
+    24.04 under TCG aarch64 emulation, where systemd-socket-activated
+    ssh@.service can take 30-60 s to spin up on the first connection, so a
+    10 s window misreads every probe as "connection timeout"."""
     osname = env("VM_OS_NAME")
     if not osname:
         return False, ""
+    if timeout is None:
+        try:
+            timeout = int(env("VM_SSH_READY_TIMEOUT") or "10")
+        except (TypeError, ValueError):
+            timeout = 10
     # -v gives the line we actually want to see ("Permission denied
     # (publickey)", "Connection refused", "ssh: connect to host ... port
     # 22: No route to host"). LogLevel=ERROR would mute -v -- drop it.
@@ -2189,7 +2211,7 @@ def _wait_ssh(max_retries=100, restart_cb=None):
     # failed (auth denied, refused, etc.) without flooding the build log.
     VERBOSE_EVERY = 5
     while True:
-        ok, err = _ssh_ready_check(10)
+        ok, err = _ssh_ready_check()
         if ok:
             break
         # First failure and every Nth retry: log the trimmed -v output so
@@ -2578,7 +2600,7 @@ def main(argv):
             log("verification startVM failed; aborting")
             return 1
         while True:
-            ok, _err = _ssh_ready_check(timeout=10)
+            ok, _err = _ssh_ready_check()
             if ok:
                 break
             log("not ready yet, just sleep."); time.sleep(5)
