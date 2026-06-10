@@ -3,6 +3,14 @@ name: "Update Readme"
 permissions:
   contents: write
 
+# Serialize readme runs on the same ref. This workflow fires on BOTH push and
+# release:published, so a release plus the commits around it can spawn several
+# runs that race each other's `git push`. Queue them instead (cancel-in-progress
+# false) so two readme bots never push concurrently.
+concurrency:
+  group: update-readme-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
   push:
@@ -61,6 +69,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -m "Update version to ${{ steps.get-latest-release.outputs.tag_name }}"
-          git pull --rebase --autostash
-          git push
+          # Retry pull-rebase-push: another run (or a human) may push to main in
+          # the window between our pull and our push, which gets the push
+          # rejected ("cannot lock ref ... is at X but expected Y"). Re-fetch,
+          # rebase our commit on top, and try again. The `if` keeps `bash -e`
+          # from aborting the loop on a failed pull/push.
+          for attempt in 1 2 3 4 5; do
+            if git pull --rebase --autostash && git push; then
+              exit 0
+            fi
+            echo "push rejected (attempt $attempt/5): remote moved, retrying after backoff"
+            sleep $((attempt * 3))
+          done
+          echo "ERROR: could not push README update after 5 attempts" >&2
+          exit 1
 

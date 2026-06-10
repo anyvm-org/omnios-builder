@@ -341,6 +341,10 @@ def qemu_bin_name():
     if a == "aarch64": return "qemu-system-aarch64"
     if a == "riscv64": return "qemu-system-riscv64"
     if a == "sparc64": return "qemu-system-sparc64"
+    # QEMU ships powerpc64 (big-endian) and powerpc64le (little-endian) under
+    # the same binary; the -M pseries machine + -cpu pickselect the mode.
+    if a in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
+        return "qemu-system-ppc64"
     if a in ("x86_64", "amd64"): return "qemu-system-x86_64"
     return "qemu-system-" + a
 
@@ -372,6 +376,13 @@ def qemu_accel():
         if HOST_ARCH in ("aarch64", "arm64"):
             if kvm_ok(): return "kvm"
             if hvf_supported(): return "hvf"
+        return "tcg"
+    if a in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
+        # KVM-HV / KVM-PR is only available when the host is also ppc64
+        # (POWER8/POWER9 bare metal). On amd64 runners we always fall back
+        # to TCG; pseries + power9 runs acceptably in TCG.
+        if HOST_ARCH in ("ppc64", "ppc64le", "powerpc64", "powerpc64le"):
+            if kvm_ok(): return "kvm"
         return "tcg"
     if HOST_ARCH in ("x86_64", "amd64"):
         if kvm_ok(): return "kvm"
@@ -560,7 +571,17 @@ _AARCH64_EFI_CODE_RELNAMES = [
 
 
 def _find_aarch64_efi_code(qemu_bin=None):
-    """Locate the aarch64 EDK2 CODE firmware. Returns full path or ''."""
+    """Locate the aarch64 EDK2 CODE firmware. Returns full path or ''.
+
+    $VM_EFI_CODE overrides the search entirely -- per-conf knob for guests
+    that need a non-default firmware (e.g. Ubuntu 26.04 aarch64 boots with
+    AAVMF_CODE.secboot.fd + AAVMF_VARS.ms.fd because its shim is signed by
+    Microsoft's Canonical sub-CA)."""
+    override = env("VM_EFI_CODE")
+    if override:
+        if os.path.exists(override):
+            return override
+        log("VM_EFI_CODE=%s not found; falling back to autodetect" % override)
     for d in _aarch64_efi_search_dirs(qemu_bin):
         for rn in _AARCH64_EFI_CODE_RELNAMES:
             p = os.path.join(d, rn)
@@ -571,6 +592,11 @@ def _find_aarch64_efi_code(qemu_bin=None):
 
 def _find_aarch64_efi_vars(code_src, qemu_bin=None):
     """Find a VARS template matching the given CODE firmware.
+
+    $VM_EFI_VARS overrides the search entirely -- per-conf knob for guests
+    that need a non-default firmware (e.g. Ubuntu 26.04 aarch64 boots with
+    AAVMF_CODE.secboot.fd + AAVMF_VARS.ms.fd because its shim is signed by
+    Microsoft's Canonical sub-CA).
 
     Search CODE's own directory first (matching same-vendor pair) and then
     fall back to **all** EFI search dirs -- on Debian/Ubuntu the
@@ -584,6 +610,11 @@ def _find_aarch64_efi_vars(code_src, qemu_bin=None):
     A blank vars region is **always wrong on aarch64** -- if no template is
     found anywhere we return '' and the caller logs a warning.
     """
+    override = env("VM_EFI_VARS")
+    if override:
+        if os.path.exists(override):
+            return override
+        log("VM_EFI_VARS=%s not found; falling back to autodetect" % override)
     if not code_src:
         return ""
     base = os.path.basename(code_src)
@@ -652,7 +683,15 @@ def build_qemu_args(media_kind=None, media_path=None):
     # offsets the wall clock by the timezone (TLS / cert breakage). Mirrors
     # anyvm.py:5173-5176.
     rtc_base = "localtime" if osname in ("windows", "haiku") else "utc"
-    a += ["-name", osname, "-m", "6144", "-smp", env("VM_CPU") or "2",
+    # VM_MEMORY honours per-conf overrides; the default 6144 covers the
+    # bulk of guests. RISC-V virt machines place the FDT blob near the top
+    # of RAM, and Ubuntu 22.04 riscv64's u-boot puts it right at the 8 GB
+    # boundary -- with -m 6144 the FDT lands BEYOND our allocated RAM and
+    # u-boot bails with "Failed to reserve memory for fdt". Per-conf
+    # VM_MEMORY=8192 (or similar) sidesteps that without bumping every
+    # other guest's footprint.
+    a += ["-name", osname, "-m", env("VM_MEMORY") or "6144",
+          "-smp", env("VM_CPU") or "2",
           "-rtc", "base=%s,clock=host,driftfix=slew" % rtc_base]
     # slirp DHCP pinned to .254 (see SLIRP_EXPECTED_GUEST_IP for rationale).
     # hostfwd target is the explicit guest IP so port forwarding never races
@@ -660,10 +699,13 @@ def build_qemu_args(media_kind=None, media_path=None):
     a += ["-netdev", "user,id=net0,net=192.168.122.0/24,host=192.168.122.1,"
           "dhcpstart=192.168.122.254,ipv6=off,"
           "hostfwd=tcp:127.0.0.1:%s-192.168.122.254:22" % sshport]
-    # virtio-rng-pci for all guests EXCEPT solaris -- Solaris does not have
-    # a virtio-rng driver and the unrecognized device disrupts early boot.
+    # virtio-rng-pci for all guests EXCEPT solaris and sparc64 -- Solaris does
+    # not have a virtio-rng driver and the unrecognized device disrupts early
+    # boot; the QEMU sun4u (sparc64) machine has no free PCI slot for it
+    # ("PCI: no slot/function available for virtio-rng-pci") and NetBSD/sparc64
+    # has no virtio bus on sun4u anyway, so QEMU would abort at launch.
     # Mirrors anyvm.py:5627.
-    if osname != "solaris":
+    if osname != "solaris" and arch != "sparc64":
         a += ["-object", "rng-builtin,id=rng0",
               "-device", "virtio-rng-pci,rng=rng0,max-bytes=1024,period=1000"]
 
@@ -695,6 +737,15 @@ def build_qemu_args(media_kind=None, media_path=None):
         if accel in ("kvm", "hvf"): cpu = "host"
         elif env("VM_OS_NAME") == "openbsd": cpu = "neoverse-n1"
         else: cpu = "max"
+        # Per-conf override. Empirically -cpu max enables SVE/SME features
+        # that newer shim/grub binaries (Ubuntu 26.04 resolute aarch64)
+        # mishandle -- the EFI hangs right after BdsDxe "starting Boot0003
+        # Ubuntu" with no further output. -cpu cortex-a72 lacks those
+        # features and boots straight to userspace. VM_CPU_MODEL lets a
+        # single conf opt out of -cpu max without rewriting the default
+        # for every other guest.
+        if env("VM_CPU_MODEL"):
+            cpu = env("VM_CPU_MODEL")
         a += ["-machine", mopts, "-cpu", cpu]
         a += ["-device", "qemu-xhci", "-device", "%s,netdev=net0" % nic]
         a += ["-drive", "if=pflash,format=raw,readonly=on,file=%s" % efi]
@@ -722,23 +773,123 @@ def build_qemu_args(media_kind=None, media_path=None):
 
     elif arch == "riscv64":
         a += ["-machine", "virt,accel=tcg,usb=on,acpi=off", "-cpu", "rv64"]
-        a += ["-device", "qemu-xhci", "-device", "%s,netdev=net0" % nic,
-              "-device", "virtio-balloon-pci"]
-        a += ["-kernel", "/usr/lib/u-boot/qemu-riscv64_smode/u-boot.bin"]
+        # NetBSD/riscv GENERIC64 drives virtio over MMIO, not PCI: virtio-blk-pci
+        # enumerates "not configured" so the kernel can't find root ("boot
+        # device: <unknown>" -> root device prompt). Use the MMIO virtio-*-device
+        # variants for NetBSD; Ubuntu riscv64 keeps PCI.
+        nb = env("VM_OS_NAME") == "netbsd"
+        netdev = "virtio-net-device,netdev=net0" if nb else "%s,netdev=net0" % nic
+        a += ["-device", "qemu-xhci", "-device", netdev]
+        if not nb:
+            a += ["-device", "virtio-balloon-pci"]
+        # Use uboot.elf (ELF with proper entry point + segments), NOT the raw
+        # u-boot.bin -- Ubuntu's official RISC-V QEMU docs recommend the ELF
+        # variant. Empirically the .bin variant breaks the FDT handoff for
+        # Ubuntu 22.04 jammy riscv64 ("Failed to reserve memory for fdt at
+        # 0x1feead700 / FDT creation failed! hanging..."); the .elf variant
+        # is what cloud-images upstream tests against.
+        a += ["-kernel", "/usr/lib/u-boot/qemu-riscv64_smode/uboot.elf"]
         if media_kind == "disk":
-            a += ["-drive", "file=%s,format=raw,if=virtio" % media_path]
+            if nb:
+                a += ["-drive", "file=%s,format=raw,if=none,id=inst0" % media_path,
+                      "-device", "virtio-blk-device,drive=inst0"]
+            else:
+                a += ["-drive", "file=%s,format=raw,if=virtio" % media_path]
         elif media_kind == "cdrom":
             a += ["-drive", "file=%s,format=raw,if=none,id=inst0,media=cdrom" % media_path]
             a += ["-device", "usb-storage,drive=inst0"]
-        a += ["-drive", "file=%s,format=qcow2,if=virtio,discard=unmap,detect-zeroes=unmap" % qcow]
+        if nb:
+            a += ["-drive", "file=%s,format=qcow2,if=none,id=disk0,discard=unmap,detect-zeroes=unmap" % qcow,
+                  "-device", "virtio-blk-device,drive=disk0"]
+        else:
+            a += ["-drive", "file=%s,format=qcow2,if=virtio,discard=unmap,detect-zeroes=unmap" % qcow]
 
     elif arch == "sparc64":
-        a += ["-machine", "sun4u", "-device", "%s,netdev=net0" % nic]
-        a += ["-drive", "file=%s,format=qcow2,if=virtio,discard=unmap,detect-zeroes=unmap" % qcow]
+        # QEMU sun4u (UltraSPARC IIi + OpenBIOS). NetBSD/sparc64 GENERIC drives
+        # the onboard CMD646 PCI IDE (disk -> wd0, cdrom -> cd0) and a Sun Happy
+        # Meal Ethernet (hme0); it has NO virtio at all, so the old virtio-based
+        # branch never worked. Three sun4u-specific facts shape this:
+        #
+        #   * Console: OpenBIOS sends the console to the VGA framebuffer whenever
+        #     a video device is present, and the framebuffer cannot be driven
+        #     for a text build. `-vga none` removes the default VGA so OpenBIOS
+        #     and the kernel fall back to ttya == com0 == our -serial chardev.
+        #     (Hence sparc64 confs set VM_USE_CONSOLE_BUILD=1 / VM_NO_VNC_BUILD=1.)
+        #
+        #   * Memory: the sparc64 kernel's early OpenFirmware pmap bootstrap
+        #     fails to claim memory above ~2 GB ("panic: Can't claim two pages
+        #     of memory" -> Unhandled Exception 0x30) under OpenBIOS. The conf
+        #     pins VM_MEMORY=2048; this branch never touches -m.
+        #
+        #   * NIC placement: the machine's onboard hme sits on the (full)
+        #     primary PCI bus, so QEMU cannot auto-place a netdev-backed NIC
+        #     there ("no slot/function available for sunhme"). We put our hme on
+        #     the empty secondary Simba-bridge bus `pciB` and bind it to net0;
+        #     the explicit -device suppresses the default onboard NIC, so the
+        #     guest enumerates exactly one hme0.
+        a += ["-machine", "sun4u", "-vga", "none"]
+        # NIC model defaults to the onboard sunhme (hme0); a conf may override
+        # via VM_NIC (e.g. e1000 -> wm0). Either way it goes on the empty pciB.
+        sparc_nic = env("VM_NIC") or "sunhme"
+        a += ["-device", "%s,netdev=net0,bus=pciB" % sparc_nic]
+        # Main disk on IDE primary master -> wd0. qcow2 rides the cmd646 fine.
+        a += ["-drive", "file=%s,format=qcow2,if=ide,index=0" % qcow]
         if media_kind == "cdrom":
-            a += ["-cdrom", media_path, "-boot", "order=dc"]
+            # Install DVD on IDE secondary master -> cd0; boot from it.
+            a += ["-drive", "file=%s,format=raw,if=ide,index=2,media=cdrom" % media_path]
+            a += ["-boot", "order=d"]
         elif media_kind == "disk":
-            a += ["-drive", "file=%s,format=raw,if=ide" % media_path]
+            a += ["-drive", "file=%s,format=raw,if=ide,index=2" % media_path]
+            a += ["-boot", "order=c"]
+        else:
+            a += ["-boot", "order=c"]
+
+    elif arch in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
+        # QEMU pseries (sPAPR / PAPR) machine + SLOF firmware (auto-loaded
+        # by QEMU from its bundled /usr/share/qemu/slof.bin -- no -bios). This
+        # is the FreeBSD / Linux guest target on ppc64; powernv* is OPAL
+        # bare-metal and won't boot a stock distro install ISO.
+        #
+        # FreeBSD/powerpc64 is BIG-ENDIAN (ELFv1) and is the only ppc64
+        # target wired up. A little-endian port (powerpc64le, ELFv2) also
+        # exists, but its kernel takes an early Program Exception under
+        # QEMU TCG (illegal instruction at the VSX-unavailable vector) on
+        # every -cpu power8/9/10/max with QEMU 8.2.2, so it is intentionally
+        # not built here -- it would only boot on real POWER + KVM.
+        #
+        # Console: -serial chardev:serial0 is routed by pseries to the SPAPR
+        # virtual teletype (spapr-vty), which the guest enumerates as
+        # /dev/ttyu0 on FreeBSD (uart(4) over vio). Same console-build
+        # workflow as aarch64 / sparc64; the conf sets VM_USE_CONSOLE_BUILD=1
+        # + VM_NO_VNC_BUILD=1 because pseries' VGA framebuffer (cirrus/std)
+        # is not a real text console.
+        #
+        # CPU: power9 covers PowerISA 3.0, runs well under TCG, and matches
+        # FreeBSD/powerpc64's POWER8+ baseline. Override with VM_CPU_MODEL.
+        # cap-cfpc=broken,cap-sbbc=broken,cap-ibs=broken,cap-ccf-assist=off
+        # silence harmless "TCG doesn't support requested feature" warnings
+        # that pseries-noble emits for Spectre mitigations under TCG.
+        mopts = ("pseries,accel=%s,usb=off"
+                 ",cap-cfpc=broken,cap-sbbc=broken,cap-ibs=broken"
+                 ",cap-ccf-assist=off") % accel
+        cpu = env("VM_CPU_MODEL") or "power9"
+        a += ["-machine", mopts, "-cpu", cpu]
+        a += ["-device", "%s,netdev=net0" % nic]
+        a += ["-drive", "file=%s,format=qcow2,if=none,id=disk0,discard=unmap,detect-zeroes=unmap" % qcow]
+        if media_kind == "cdrom":
+            # SLOF picks the bootable CDROM by bootindex. virtio-scsi-pci +
+            # scsi-cd is the cleanest path (matches what the smoke-test boot
+            # of FreeBSD 15.0 powerpc64 disc1.iso exercised).
+            a += ["-drive", "file=%s,format=raw,if=none,id=inst0,media=cdrom" % media_path]
+            a += ["-device", "virtio-scsi-pci,id=scsi0"]
+            a += ["-device", "scsi-cd,bus=scsi0.0,drive=inst0,bootindex=0"]
+            a += ["-device", "virtio-blk-pci,drive=disk0,bootindex=1"]
+        elif media_kind == "disk":
+            a += ["-drive", "file=%s,format=raw,if=none,id=inst0" % media_path]
+            a += ["-device", "virtio-blk-pci,drive=inst0,bootindex=0"]
+            a += ["-device", "virtio-blk-pci,drive=disk0,bootindex=1"]
+        else:
+            a += ["-device", "virtio-blk-pci,drive=disk0,bootindex=0"]
 
     else:
         # x86_64 (and any other PC-class arch).
@@ -1189,6 +1340,19 @@ def setup(install_ocr=None):
         if env("VM_ARCH") == "aarch64":
             _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
                         "qemu-system-arm", "qemu-efi-aarch64"], env=apt_env)
+        if env("VM_ARCH") == "sparc64":
+            # qemu-system-sparc64 (sun4u + bundled OpenBIOS) ships in the
+            # qemu-system-sparc package; no separate firmware package needed.
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+                        "qemu-system-sparc"], env=apt_env)
+        if env("VM_ARCH") in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
+            # qemu-system-ppc64 (pseries machine) ships in the qemu-system-ppc
+            # package; its SLOF firmware (/usr/share/qemu/slof.bin) is bundled
+            # with it, so no separate firmware package is needed. The GitHub
+            # ubuntu runner image does NOT preinstall this, hence the explicit
+            # apt-get (a local dev box may already have it from qemu-system).
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+                        "qemu-system-ppc"], env=apt_env)
         # Make /dev/kvm usable by the current shell user. On GitHub Actions
         # runners (and most desktop distros) the device is mode crw-rw----
         # root:kvm and the runner / login user is NOT in the kvm group, so
@@ -1255,7 +1419,14 @@ def createVM(isolink=None, ostype=None, sshport=None, disklink=None):
         if not os.path.exists(vdi):
             download(disklink, vdi)
     else:
-        run(["qemu-img", "create", "-f", "qcow2", "-o", "preallocation=off", vdi, "200G"])
+        # Default disk is 200G (sparse), but a conf can pin a smaller size via
+        # VM_DISK_SIZE. NetBSD/sparc64 needs this: the OpenFirmware FCode
+        # bootblock mis-reads ofwboot from a large root FFS ("Inode not
+        # directory", NetBSD PR 56363), so the sparc64 conf builds on a ~4G
+        # disk. anyvm.py runs the image as-is (it never resizes), so the small
+        # disk carries through to the runtime VM.
+        run(["qemu-img", "create", "-f", "qcow2", "-o", "preallocation=off",
+             vdi, env("VM_DISK_SIZE") or "200G"])
     try: os.chmod(vdi, 0o777)
     except OSError: pass
     write_state(osname, "sshport", sshport or "22")
@@ -1369,6 +1540,14 @@ def _wait_vm_down(what="VM", poll=20, max_seconds=1800):
         size, tail = _serial_tail_line()
         mm, ss = divmod(elapsed, 60)
         log("[%dm%02ds] %s, serial=%dB | %s" % (mm, ss, what, size, tail[:140]))
+        # Some guests cannot power off QEMU and HALT instead: NetBSD/riscv64 and
+        # sparc64 have no working QEMU poweroff, so `shutdown -p` ends at "has
+        # halted / press any key to reboot" with QEMU still running. Treat that
+        # as down and force-kill at once rather than burning the full timeout.
+        if re.search(r"has halted|press any key to reboot", tail, re.I):
+            log("%s: guest halted without powering off QEMU; force-killing" % what)
+            destroyVM()
+            return
         if elapsed >= max_seconds:
             log("%s did not power off in %d s; force-killing QEMU"
                 % (what, max_seconds))
@@ -2276,7 +2455,14 @@ def shutdown_and_wait():
     if isRunning() == 0:
         if shutdownVM() != 0:
             log("shutdown error")
-    _wait_vm_down(what="VM shutdown", poll=5)
+    # VM_SHUTDOWN_MAX_SECONDS lets a conf extend the poweroff wait. NetBSD
+    # sparc64 needs this: concurrent net+disk DMA during the build (pkg_add)
+    # drives QEMU's sun4u CMD646 into a sustained "lost interrupt" state, so the
+    # final `shutdown -p` sync crawls (each command times out ~10s). Give it
+    # enough time to reach "has halted" cleanly -- a premature force-kill mid-
+    # sync can corrupt the root FFS and drop the verify VM to single-user.
+    smax = int(env("VM_SHUTDOWN_MAX_SECONDS") or 1800)
+    _wait_vm_down(what="VM shutdown", poll=5, max_seconds=smax)
     closeConsole()
 
 
