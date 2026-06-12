@@ -92,3 +92,19 @@ jobs:
           omnios-${{ matrix.os }}.qemu
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
