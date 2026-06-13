@@ -1065,6 +1065,23 @@ def build_qemu_args(media_kind=None, media_path=None):
         # OpenBSD desktop -> cirrus, default -> virtio (= virtio-vga on x86).
         a += ["-vga", vga_type()]
 
+    # Optional cloud-init NoCloud seed: when VM_SEED_ISO names an existing
+    # file (generated at build time by a prepareImage hook -- never committed
+    # to git), attach it as a second CDROM on every boot so cloud-init in
+    # BASIC-CLOUDINIT guest images can pick up its user-data on first boot.
+    # No bootindex / not in -boot order: firmware keeps booting the disk; the
+    # seed is data-only. Re-attaching on later boots is harmless (cloud-init
+    # runs once per instance-id, and the hook's user-data disables cloud-init
+    # in the final artifact anyway). Gated on the env var, so every conf that
+    # does not set VM_SEED_ISO is completely unaffected.
+    seed = env("VM_SEED_ISO")
+    if seed and os.path.exists(seed):
+        if arch == "aarch64":
+            a += ["-drive", "file=%s,format=raw,if=none,id=seed0,media=cdrom" % seed,
+                  "-device", "usb-storage,drive=seed0"]
+        else:
+            a += ["-drive", "file=%s,format=raw,if=ide,index=2,media=cdrom" % seed]
+
     # VNC display number = port - 5900 (display :N <-> TCP 5900+N).
     a += ["-display", "vnc=127.0.0.1:%d" % (vncport - 5900)]
     if not console and arch != "aarch64":
@@ -1441,9 +1458,10 @@ def setup(install_ocr=None):
             # qemu-system-data dependency.
             _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
                         "qemu-system-s390x"], env=apt_env)
-        # A conf may ship its own QEMU build as a tarball committed in the
-        # builder repo (bin/ + share/qemu layout, built against the
-        # runner's distro libs; see ubuntu-builder files/README.md) --
+        # A conf may ship its own QEMU build as a tarball (bin/ +
+        # share/qemu layout, built against the runner's distro libs;
+        # generated on the fly by hooks/host_beforeBuild.sh -- see
+        # ubuntu-builder files/README.md and files/build-qemu10.sh) --
         # extract it here and the conf points VM_QEMU_BIN at the extracted
         # binary. Arch-independent: riscv64 (Ubuntu 26.04 needs QEMU >= 9.1
         # for -cpu rva23s64) and s390x (stock 8.2 TCG intermittently
@@ -2879,6 +2897,12 @@ def main(argv):
     sshport = g["sshport"]
     opts = g["opts"]
 
+    # Earliest hook point: runs before setup() (which, among other things,
+    # extracts VM_QEMU_TAR), so a builder can generate build inputs on the
+    # fly -- e.g. ubuntu-builder's hooks/host_beforeBuild.sh compiles its
+    # pinned QEMU tarball here instead of committing 30MB binaries to git.
+    run_hook("beforeBuild")
+
     startWeb("needOCR")
     setup("needOCR")
 
@@ -2988,40 +3012,49 @@ def main(argv):
                 inst_body = f.read()
             payload = 'set -e\nANYVM_PKGS="%s"\nANYVM_PKG_PATH="%s"\n%s\n' % (
                 env("VM_PRE_INSTALL_PKGS"), env("VM_PKG_PATH") or "", inst_body)
-            # Relax the client keepalive for this session: ~/.ssh/config (the
-            # enablessh block above) sets ServerAliveInterval=1, i.e. the
-            # client drops the connection after ~3 s without a keepalive
-            # reply. A CPU-heavy install step on a TCG guest (e.g. pkgfetch's
-            # gunzip+awk over a 25k-entry pkg_summary on an emulated sparc64)
-            # starves sshd long enough to trip that, the stdin-fed sh dies
-            # with the connection, and the packages silently never install.
-            # Command-line -o options override ssh_config, so tolerate ~10
-            # minutes of unresponsiveness here.
-            rc = subprocess.run(["ssh", "-o", "ServerAliveInterval=30",
-                                 "-o", "ServerAliveCountMax=20",
-                                 osname, "sh"], input=payload.encode()).returncode
-            if rc != 0:
-                log("install script FAILED rc=%d" % rc)
-                # Fail the build: a green job that ships an artifact without
-                # its packages is worse than a red one (Ubuntu cloud images
-                # dropped their pre-baked universe indexes in the 2026-06-10
-                # serials and 12 jobs went green while every artifact was
-                # missing rsync/sshfs/nfs-common -- caught only by the
-                # downstream anyvm tests). A package that genuinely cannot
-                # install on some release belongs OUT of that conf's
-                # VM_PRE_INSTALL_PKGS list, not silently tolerated.
-                return 1
         else:
             cmd = "%s %s" % (env("VM_INSTALL_CMD"), env("VM_PRE_INSTALL_PKGS"))
             log(cmd)
+            payload = "set -e\n%s\n" % cmd
+        # Relax the client keepalive for this session: ~/.ssh/config (the
+        # enablessh block above) sets ServerAliveInterval=1, i.e. the client
+        # drops the connection after ~3 s without a keepalive reply. A
+        # CPU-heavy install step on a TCG guest (e.g. pkgfetch's gunzip+awk
+        # over a 25k-entry pkg_summary on an emulated sparc64) starves sshd
+        # long enough to trip that, the stdin-fed sh dies with the
+        # connection, and the packages silently never install. Command-line
+        # -o options override ssh_config, so tolerate ~10 minutes of
+        # unresponsiveness here.
+        #
+        # One reroll on failure, like the login and verify waits: a guest can
+        # die underneath the install for random reasons (a sparc64 cmd646
+        # wedge cascading into disk EIO killed sshd mid-fetch on CI:
+        # "Connection ... closed by remote host", rc=255). Reboot once and
+        # retry; a deterministic failure (a package that genuinely cannot
+        # install) still fails the build on the second attempt.
+        inst_ok = False
+        for inst_attempt in (1, 2):
             rc = subprocess.run(["ssh", "-o", "ServerAliveInterval=30",
                                  "-o", "ServerAliveCountMax=20",
-                                 osname, "sh"],
-                                input=("set -e\n%s\n" % cmd).encode()).returncode
-            if rc != 0:
-                log("install step FAILED rc=%d" % rc)
-                # See the comment in the install-script branch above.
-                return 1
+                                 osname, "sh"], input=payload.encode()).returncode
+            if rc == 0:
+                inst_ok = True
+                break
+            log("install step FAILED rc=%d (attempt %d/2)" % (rc, inst_attempt))
+            if inst_attempt == 1:
+                log("rebooting the guest for a fresh install attempt")
+                if restart_and_wait() != 0:
+                    break
+        if not inst_ok:
+            # Fail the build: a green job that ships an artifact without its
+            # packages is worse than a red one (Ubuntu cloud images dropped
+            # their pre-baked universe indexes in the 2026-06-10 serials and
+            # 12 jobs went green while every artifact was missing
+            # rsync/sshfs/nfs-common -- caught only by the downstream anyvm
+            # tests). A package that genuinely cannot install on some
+            # release belongs OUT of that conf's VM_PRE_INSTALL_PKGS list,
+            # not silently tolerated.
+            return 1
 
     run_hook("finalize")
 
