@@ -909,8 +909,10 @@ def build_qemu_args(media_kind=None, media_path=None):
         #   * a patched OpenBIOS via VM_BIOS (the bundled blob makes every
         #     >= 7.3 kernel crash on cold boot and breaks root autodetection;
         #     see openbsd-builder bios/README.md),
-        #   * VM_NIC=ne2k_pci (-> ne0; OpenBSD has no sunhme driver problem,
-        #     but ne2k_pci is the empirically verified model on pciB),
+        #   * VM_NIC=e1000 (-> em0); ne2k_pci (-> ne0) also enumerates on
+        #     pciB but wedges the cmd646 PCI-IDE into a "lost interrupt"
+        #     write-timeout storm when net + disk DMA overlap, so e1000 is
+        #     used instead (keeps boot clean under slow TCG),
         #   * usb=off to match the locally verified config -- OpenBIOS USB
         #     probing is dead weight on a serial-only machine. NetBSD was
         #     verified with the default usb=on, so only openbsd gets the
