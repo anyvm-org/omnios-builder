@@ -931,6 +931,15 @@ def build_qemu_args(media_kind=None, media_path=None):
             # Install DVD on IDE secondary master -> cd0; boot from it.
             a += ["-drive", "file=%s,format=raw,if=ide,index=2,media=cdrom" % media_path]
             a += ["-boot", "order=d"]
+            if osname == "openbsd":
+                # Boot the install RAMDISK kernel (/bsd on the sparc64 CD) with
+                # the -c flag so it stops in UKC before autoconfiguration. The
+                # install hook (host_installOpts.py) then forces the root disk
+                # to PIO/no-DMA there, so the install's concurrent CD-read +
+                # disk-write does not wedge the cmd646 into a "lost interrupt"
+                # write-timeout storm. CDROM-only: a disk boot must NOT carry
+                # "-c" or every post-install boot would drop into UKC.
+                a += ["-prom-env", "boot-file=bsd -c"]
         elif media_kind == "disk":
             a += ["-drive", "file=%s,format=raw,if=ide,index=2" % media_path]
             a += ["-boot", "order=c"]
