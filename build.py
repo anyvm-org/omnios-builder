@@ -20,6 +20,7 @@ Usage: python3 build.py conf/<name>.conf
 
 import base64
 import concurrent.futures
+import json
 import os
 import re
 import shlex
@@ -1100,6 +1101,215 @@ def build_qemu_args(media_kind=None, media_path=None):
     return a
 
 
+# ----------------------------------------------------------------------------
+# Guest hardware profile
+# ----------------------------------------------------------------------------
+#
+# build_qemu_args() (above) and anyvm.py's launch path independently decide the
+# guest's QEMU hardware shape -- machine type, CPU model, disk bus, NIC, VGA,
+# RNG, firmware kind -- from the same per-(os,arch,release) facts. They were
+# kept in lock-step BY HAND (every helper here and in build_qemu_args carries a
+# "Mirrors anyvm.py:NNNN" note), and they silently drifted: an image would
+# build + verify green here, then fail to boot under anyvm.py because the two
+# argv assemblers disagreed on one device.
+#
+# build_guest_profile() captures those decisions ONCE, at build time, from the
+# code that actually produced the image, and exportOVA() ships it beside the
+# qcow2 as <output>.profile.json (a published release asset). anyvm.py reads it
+# and drives its launch from this single source of truth, so a new guest only
+# needs its conf + build.py -- never a parallel edit in anyvm.py.
+#
+# The profile records ONLY host-independent guest-shape facts. Everything that
+# depends on the MACHINE RUNNING the VM stays owned by anyvm.py: the QEMU
+# binary, acceleration (kvm/hvf/whpx/tcg) and the host-tied `-cpu host` model,
+# firmware file discovery, ports, display/VNC, and every user --flag override.
+
+GUEST_PROFILE_VERSION = 1
+
+
+def _profile_machine():
+    """(machine_type, machine_opts) with accel EXCLUDED -- the host picks the
+    accelerator at run time. Mirrors the -machine strings build_qemu_args()
+    assembles per arch."""
+    arch = env("VM_ARCH") or "x86_64"
+    osname = env("VM_OS_NAME")
+    if arch == "aarch64":
+        opts = "gic-version=3,usb=on"
+        if obsd_acpi_off():
+            opts += ",acpi=off"
+        return "virt", opts
+    if arch == "riscv64":
+        return "virt", "usb=on,acpi=off"
+    if arch == "s390x":
+        return "s390-ccw-virtio", ""
+    if arch == "sparc64":
+        return "sun4u", ("usb=off" if osname == "openbsd" else "")
+    if arch in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
+        return "pseries", ("usb=off,cap-cfpc=broken,cap-sbbc=broken,"
+                           "cap-ibs=broken,cap-ccf-assist=off")
+    return "pc", "hpet=off,smm=off,graphics=on,vmport=off,usb=on"
+
+
+def _profile_cpu_model():
+    """Guest-mandated CPU MODEL (the software model), or None to let anyvm.py
+    pick a host-aware one. A VM_CPU_MODEL conf override wins. build_qemu_args()
+    uses `host` under KVM/HVF, but that is host-specific and is NEVER recorded:
+    anyvm.py keeps `host` under hardware accel and falls back to this model
+    under TCG (the common case on an end user's machine)."""
+    m = env("VM_CPU_MODEL")
+    if m:
+        return m
+    arch = env("VM_ARCH") or "x86_64"
+    osname = env("VM_OS_NAME")
+    if arch == "aarch64":
+        return "neoverse-n1" if osname == "openbsd" else "max"
+    if arch == "riscv64":
+        return "rv64"
+    if arch == "s390x":
+        return "qemu"
+    if arch in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
+        return "power9"
+    # sparc64 (sun4u carries no -cpu) and x86_64 (anyvm.py picks qemu64 under
+    # TCG, host/Broadwell-v4 under KVM -- all host-aware) record no model.
+    return None
+
+
+def _profile_rng():
+    """virtio-rng transport: 'pci', 'ccw' (s390x), or 'none'. Mirrors the
+    build_qemu_args() rng gating (skipped for solaris and sparc64; CCW bus on
+    s390x)."""
+    arch = env("VM_ARCH") or "x86_64"
+    if arch == "s390x":
+        return "ccw"
+    if env("VM_OS_NAME") == "solaris" or arch == "sparc64":
+        return "none"
+    return "pci"
+
+
+def _profile_firmware_kind():
+    """Firmware ROLE the guest needs (not a path -- anyvm.py discovers the
+    actual file on the host): 'bios' (explicit -bios override, e.g. the patched
+    OpenBIOS for openbsd/sparc64), 'edk2-pflash' (aarch64), 'uboot' (riscv64
+    -kernel payload; anyvm.py may prefer EDK2 when present), or 'default'
+    (firmware QEMU bundles for the machine -- SeaBIOS / SLOF / s390-ccw)."""
+    arch = env("VM_ARCH") or "x86_64"
+    if env("VM_BIOS"):
+        return "bios"
+    if arch == "aarch64":
+        return "edk2-pflash"
+    if arch == "riscv64":
+        return "uboot"
+    return "default"
+
+
+def _profile_qemu_min_version():
+    """Minimum QEMU version this guest needs ("X.Y[.Z]"), or None when the
+    runner's stock QEMU sufficed. Parsed from the conf's VM_QEMU_TAR /
+    VM_QEMU_BIN pin: the builder pins a newer QEMU for guests the distro's
+    stock build cannot run (ubuntu ppc64le 22.04 / s390x all / riscv64 26.04 --
+    TCG miscompiles or a missing CPU model). anyvm.py must apply the same floor
+    (its ensure_pinned_qemu downloads a matching build) or the guest boots on a
+    too-old QEMU and fails -- a classic build-green / run-broken split."""
+    src = env("VM_QEMU_TAR") or env("VM_QEMU_BIN") or ""
+    m = re.search(r"qemu-(\d+\.\d+(?:\.\d+)?)", src)
+    return m.group(1) if m else None
+
+
+def _profile_balloon():
+    """Whether build_qemu_args() attaches virtio-balloon-pci. x86 always; riscv64
+    except NetBSD (its GENERIC64 cannot drive the PCI balloon); never on aarch64
+    / s390x / sparc64 / pseries."""
+    arch = env("VM_ARCH") or "x86_64"
+    if arch == "x86_64":
+        return True
+    if arch == "riscv64" and env("VM_OS_NAME") != "netbsd":
+        return True
+    return False
+
+
+def build_guest_profile():
+    """Normalized, host-independent description of the guest's QEMU hardware
+    shape (see the section comment above). Reuses the same helpers
+    build_qemu_args() calls -- net_card(), disk_if(), vga_type(),
+    obsd_acpi_off() -- so disk/NIC/VGA/ACPI carry ZERO drift; the rest mirrors
+    build_qemu_args()'s per-arch blocks."""
+    arch = env("VM_ARCH") or "x86_64"
+    osname = env("VM_OS_NAME")
+    mtype, mopts = _profile_machine()
+    # NetBSD/riscv64 GENERIC64 has no PCI virtio bus, so build_qemu_args() drives
+    # virtio over the MMIO transport there (virtio-blk-device / virtio-net-device).
+    mmio = (osname == "netbsd" and arch == "riscv64")
+    nic = net_card()
+    if mmio and nic == "virtio-net-pci":
+        nic = "virtio-net-device"
+    # disk bus. build_qemu_args()'s sparc64 (sun4u) branch hardwires the disk
+    # to IDE (wd0) and never consults disk_if(), whose generic default would
+    # say virtio -- record the real bus here.
+    dif = "ide" if arch == "sparc64" else disk_if()
+    # Effective VGA device, normalized the way build_qemu_args() emits it.
+    if arch == "sparc64":
+        vga = "none"
+    elif arch in ("riscv64", "s390x", "powerpc64", "powerpc64le",
+                  "ppc64", "ppc64le"):
+        vga = None             # console-only arches add no video device
+    elif arch == "aarch64":
+        v = vga_type()
+        vga = "virtio-gpu-pci" if v in ("virtio", "virtio-gpu", "std", "") else v
+    else:
+        vga = vga_type()       # x86: std / cirrus / virtio
+    # Hard guest limits. sun4u (sparc64) is uniprocessor and its early
+    # OpenFirmware pmap bootstrap panics above ~2 GB (1 GB for openbsd).
+    mem_cap = None
+    cpu_cap = None
+    if arch == "sparc64":
+        mem_cap = 1024 if osname == "openbsd" else 2048
+        cpu_cap = 1
+    return {
+        "anyvm_profile_version": GUEST_PROFILE_VERSION,
+        "os": osname,
+        "arch": arch,
+        "release": env("VM_RELEASE"),
+        "machine_type": mtype,
+        "machine_opts": mopts,
+        "cpu_model": _profile_cpu_model(),
+        "disk_if": dif,
+        "virtio_transport": "mmio" if mmio else "pci",
+        "net_card": nic,
+        "net_bus": "pciB" if arch == "sparc64" else None,
+        "vga": vga,
+        "rng": _profile_rng(),
+        "firmware_kind": _profile_firmware_kind(),
+        "qemu_min_version": _profile_qemu_min_version(),
+        "balloon": _profile_balloon(),
+        # RTC epoch the guest expects: windows/haiku read the CMOS clock as
+        # local time, everything else as UTC. Mirrors build_qemu_args()'s
+        # rtc_base and anyvm.py's.
+        "rtc_base": "localtime" if osname in ("windows", "haiku") else "utc",
+        "console": bool(env("VM_USE_CONSOLE_BUILD")),
+        "mem_cap_mb": mem_cap,
+        "cpu_cap": cpu_cap,
+    }
+
+
+def _profile_sanity_check(profile, cmdline_path):
+    """Best-effort same-file drift guard: warn (never fail) when a profile
+    value is absent from the QEMU command line build_qemu_args() actually
+    launched. Catches build_guest_profile() falling out of step with
+    build_qemu_args() at CI time, where it is cheap to notice."""
+    try:
+        with open(cmdline_path) as f:
+            cl = f.read()
+    except OSError:
+        return
+    checks = [("machine_type", profile.get("machine_type")),
+              ("cpu_model", profile.get("cpu_model")),
+              ("net_card", profile.get("net_card"))]
+    for name, val in checks:
+        if val and val not in cl:
+            log("WARNING: guest profile %s=%r not found in launched cmdline "
+                "(build_guest_profile drifted from build_qemu_args?)" % (name, val))
+
+
 def launch_qemu(media_kind=None, media_path=None):
     """Launch QEMU detached so it survives this Python process."""
     osname = env("VM_OS_NAME")
@@ -1543,7 +1753,7 @@ def setup(install_ocr=None):
 # (G) VM lifecycle
 # ============================================================================
 
-def createVM(isolink=None, ostype=None, sshport=None, disklink=None):
+def createVM(isolink=None, sshport=None, disklink=None):
     osname = _check_osname("createVM")
     if not osname: return 1
     vdi = "%s.qcow2" % osname
@@ -1575,7 +1785,7 @@ def createVM(isolink=None, ostype=None, sshport=None, disklink=None):
     return launch_qemu("cdrom", iso)
 
 
-def createVMFromVHD(ostype=None, sshport=None):
+def createVMFromVHD(sshport=None):
     osname = _check_osname("createVMFromVHD")
     if not osname: return 1
     vhd = "%s.qcow2" % osname
@@ -2156,6 +2366,21 @@ def exportOVA(ova=None, qemu_args=None):
         else:
             with open(qemu_args, "w") as f:
                 f.write("# no launch descriptor recorded for %s\n" % osname)
+        # Normalized guest-shape profile published beside the qcow2 so anyvm.py
+        # launches from a single source of truth (see build_guest_profile()).
+        # Best-effort: the image is already exported, so a profile failure must
+        # never fail the build -- anyvm.py just falls back to its built-in logic
+        # when the asset is missing.
+        prof_path = re.sub(r"\.qemu$", "", qemu_args) + ".profile.json"
+        try:
+            profile = build_guest_profile()
+            with open(prof_path, "w") as f:
+                json.dump(profile, f, indent=2, sort_keys=True)
+                f.write("\n")
+            log("Wrote guest profile %s" % prof_path)
+            _profile_sanity_check(profile, cl)
+        except Exception as e:
+            log("WARNING: could not write guest profile %s: %s" % (prof_path, e))
     return 0
 
 
@@ -2443,7 +2668,7 @@ def run_hook(name):
                                The hook can call build.py functions directly
                                (waitForText, inputKeys, string, enter,
                                screenText, ...) and see pipeline globals
-                               (osname, ostype, sshport, opts) as bare names.
+                               (osname, sshport, opts) as bare names.
                                Use whenever the hook needs the VM-abstraction
                                API. Lookup precedence #1.
 
@@ -2900,11 +3125,9 @@ def main(argv):
     # etc., mirroring how build.sh's source-d hooks saw shell variables).
     g = globals()
     g["osname"] = env("VM_OS_NAME")
-    g["ostype"] = env("VM_OS_TYPE")
     g["sshport"] = env("VM_SSH_PORT")
     g["opts"] = env("VM_OPTS")
     osname = g["osname"]
-    ostype = g["ostype"]
     sshport = g["sshport"]
     opts = g["opts"]
 
@@ -2925,7 +3148,7 @@ def main(argv):
         log("vm does not exist (ok)")
 
     if env("VM_ISO_LINK"):
-        if createVM(env("VM_ISO_LINK"), ostype, sshport, env("VM_PRE_DISK_LINK")) != 0:
+        if createVM(env("VM_ISO_LINK"), sshport, env("VM_PRE_DISK_LINK")) != 0:
             log("createVM failed; aborting")
             return 1
         time.sleep(2)
@@ -2946,7 +3169,7 @@ def main(argv):
     elif env("VM_VHD_LINK"):
         _prep_vhd_disk(env("VM_VHD_LINK"))
         run_hook("prepareImage")
-        createVMFromVHD(ostype, sshport)
+        createVMFromVHD(sshport)
         time.sleep(5)
     else:
         log("no VM_ISO_LINK or VM_VHD_LINK, can not build.")
