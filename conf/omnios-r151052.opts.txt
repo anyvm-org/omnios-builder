@@ -46,10 +46,11 @@ now has a working and mounted boot | enter
 
 # Installer main menu. Its default highlighted item is "Configure the
 # installed OmniOS system", so enter opens the first-boot configuration menu
-# (Network / SSH / etc.) -- it does NOT reboot. Match "Configure the
-# installed", which is unique to this menu and free of the OmniOS/Omnios case
-# drift PaddleOCR shows in the banner/title.
-Configure the installed | enter
+# (Network / SSH / etc.) -- it does NOT reboot. Match just "the installed":
+# PP-OCRv6 misreads "Configure" as "Confiqure" (g->q) on this screen, and the
+# banner also shows OmniOS/Omnios case drift, so anchor on the two words that
+# read cleanly and are still unique to this menu.
+the installed | enter
 
 
 # --- First-boot OmniOS configuration menu (Network / SSH / etc.) ---
