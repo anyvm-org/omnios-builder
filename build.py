@@ -1616,7 +1616,7 @@ def setup(install_ocr=None):
             if env("VM_OCR") == "paddle":
                 # Neural OCR (see ocr_paddle) for installer dialogs whose dim /
                 # low-contrast text tesseract cannot read. Install the engine,
-                # then warm it once so the PP-OCRv6 small models download here
+                # then warm it once so the PP-OCRv6 medium models download here
                 # during setup rather than stalling the first waitForText poll.
                 # Use `sys.executable -m pip`, not bare `pip3`: on GitHub
                 # runners pip3 and the python3 running build.py can resolve to
@@ -1976,28 +1976,34 @@ _PADDLE_OCR = None
 
 
 def ocr_paddle(img):
-    """OCR via PaddleOCR (PP-OCRv6 small det + rec). Used when a
+    """OCR via PaddleOCR (PP-OCRv6 medium det + rec). Used when a
     conf sets VM_OCR=paddle. PaddleOCR's neural recognizer reads dim / low-
     contrast installer dialog text that tesseract drops entirely (e.g. the
     OmniOS "Enter the system hostname" box), so no per-screen colour tricks
-    are needed. The engine is built once and reused. enable_mkldnn=False
-    avoids a paddlepaddle 3.x oneDNN/PIR crash; the doc-orientation / unwarp /
+    are needed. The medium tier (not small/tiny) is deliberate: the lighter
+    PP-OCRv6 tiers have a systematic g->q misread on the OmniOS console font
+    (login->loqin, Configure->Confiqure, Copyright->Copyriqht) that breaks
+    waitForText matching; medium reads them cleanly at the cost of a heavier
+    predict. The engine is built once and reused. enable_mkldnn=False avoids a
+    paddlepaddle 3.x oneDNN/PIR crash; the doc-orientation / unwarp /
     textline-orientation sub-models are disabled (a flat console screen needs
-    none) to keep each predict near ~1s. Falls back to tesseract on any
-    error / if PaddleOCR is not installed."""
+    none). Falls back to tesseract on any error / if PaddleOCR is not
+    installed."""
     global _PADDLE_OCR
     try:
         if _PADDLE_OCR is None:
             # Cap CPU: paddlepaddle otherwise spins ~6 OpenMP threads per
             # predict, which on a 2-4 vCPU CI runner saturates the box and
             # starves the KVM guest's boot / sshd. cpu_threads=2 plus
-            # OMP_NUM_THREADS keep each predict near ~1s while staying in budget.
+            # OMP_NUM_THREADS hold the thread count down while staying in
+            # budget (the medium model is heavier than mobile/small, so a
+            # predict runs a few seconds rather than ~1s).
             os.environ.setdefault("OMP_NUM_THREADS", "2")
             from paddleocr import PaddleOCR
             _PADDLE_OCR = PaddleOCR(
                 lang="en", enable_mkldnn=False, cpu_threads=2,
-                text_detection_model_name="PP-OCRv6_small_det",
-                text_recognition_model_name="PP-OCRv6_small_rec",
+                text_detection_model_name="PP-OCRv6_medium_det",
+                text_recognition_model_name="PP-OCRv6_medium_rec",
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False)
