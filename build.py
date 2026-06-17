@@ -1616,14 +1616,14 @@ def setup(install_ocr=None):
             if env("VM_OCR") == "paddle":
                 # Neural OCR (see ocr_paddle) for installer dialogs whose dim /
                 # low-contrast text tesseract cannot read. Install the engine,
-                # then warm it once so the PP-OCRv5 mobile models download here
+                # then warm it once so the PP-OCRv6 small models download here
                 # during setup rather than stalling the first waitForText poll.
                 # Use `sys.executable -m pip`, not bare `pip3`: on GitHub
                 # runners pip3 and the python3 running build.py can resolve to
                 # different interpreters / site-packages.
                 if _sh_quiet(pip + " --break-system-packages "
-                             "paddlepaddle paddleocr") != 0:
-                    _sh_quiet(pip + " paddlepaddle paddleocr")
+                             "paddlepaddle 'paddleocr>=3.7'") != 0:
+                    _sh_quiet(pip + " paddlepaddle 'paddleocr>=3.7'")
                 # pip lands paddle in the user site-packages
                 # (~/.local/lib/pythonX.Y/site-packages). On a fresh CI runner
                 # that directory does not exist when this interpreter starts, so
@@ -1976,7 +1976,7 @@ _PADDLE_OCR = None
 
 
 def ocr_paddle(img):
-    """OCR via PaddleOCR (PP-OCRv5 mobile det + en mobile rec). Used when a
+    """OCR via PaddleOCR (PP-OCRv6 small det + rec). Used when a
     conf sets VM_OCR=paddle. PaddleOCR's neural recognizer reads dim / low-
     contrast installer dialog text that tesseract drops entirely (e.g. the
     OmniOS "Enter the system hostname" box), so no per-screen colour tricks
@@ -1996,8 +1996,8 @@ def ocr_paddle(img):
             from paddleocr import PaddleOCR
             _PADDLE_OCR = PaddleOCR(
                 lang="en", enable_mkldnn=False, cpu_threads=2,
-                text_detection_model_name="PP-OCRv5_mobile_det",
-                text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+                text_detection_model_name="PP-OCRv6_small_det",
+                text_recognition_model_name="PP-OCRv6_small_rec",
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False)
