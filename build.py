@@ -96,6 +96,28 @@ def _sh_quiet(cmdstr):
     return r.returncode
 
 
+def _run_loud(cmd, **kw):
+    """Like _run_quiet, but echo the command and let whatever it prints stream
+    straight to our stdout/stderr instead of capturing it. setup() uses this
+    (via a local alias) so each host-dependency step is announced in the log
+    as it starts -- a slow or hung install is then obvious from which command
+    was echoed last, instead of the whole phase sitting silent."""
+    log("setup: + " + " ".join(map(str, cmd)))
+    r = subprocess.run(cmd, **kw)
+    if r.returncode != 0:
+        log("FAILED (rc=%d): %s" % (r.returncode, " ".join(map(str, cmd))))
+    return r
+
+
+def _sh_loud(cmdstr):
+    """Shell-string variant of _run_loud (output streams live)."""
+    log("setup: + " + cmdstr)
+    rc = subprocess.call(cmdstr, shell=True)
+    if rc != 0:
+        log("FAILED (rc=%d): %s" % (rc, cmdstr))
+    return rc
+
+
 def state(osname, suffix):
     return "%s.%s" % (osname, suffix)
 
@@ -1589,21 +1611,27 @@ def closeConsole():
 # ============================================================================
 
 def setup(install_ocr=None):
-    """Install host dependencies. All package-manager output is captured and
-    only printed on failure -- normal runs stay quiet."""
-    log("setup: installing host dependencies (silent unless something fails)")
+    """Install host dependencies. Each package-manager step is echoed to the
+    log as it starts (and whatever it prints streams live), so a slow or hung
+    install is identifiable from the last command shown instead of the phase
+    sitting silent. The apt -q / pip -q flags stay on, so the log is not
+    flooded with per-package chatter -- only the step markers and any errors
+    appear. Alias the quiet run-helpers to their loud variants for the length
+    of this function so the call sites below need no change."""
+    _run_quiet = _run_loud
+    _sh_quiet = _sh_loud
+    log("setup: installing host dependencies (each step echoed below)")
     if is_linux():
         apt_env = dict(os.environ)
         apt_env["DEBIAN_FRONTEND"] = "noninteractive"
-        _run_quiet(["sudo", "-E", "apt-get", "update", "-qq"], env=apt_env)
-        _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
-                    "zstd", "qemu-utils", "qemu-system-x86", "ovmf", "expect",
-                    "sshpass", "netcat-openbsd"], env=apt_env)
+        _run_quiet(["sudo", "-E", "apt-get", "update", "-q"], env=apt_env)
+        _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
+                    "zstd", "qemu-utils", "qemu-system-x86", "sshpass",
+                    "netcat-openbsd"], env=apt_env)
         if install_ocr:
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "tesseract-ocr", "python3-pil",
-                        "tesseract-ocr-eng", "tesseract-ocr-script-latn",
-                        "python3-opencv", "python3-pip"], env=apt_env)
+                        "tesseract-ocr-eng", "python3-pip"], env=apt_env)
             # Use opencv-python-HEADLESS, not the full opencv-python wheel: the
             # full wheel needs libGL.so.1, which headless CI runners (GitHub
             # Actions) lack, so `import cv2` raises ImportError there. cv2 is
@@ -1621,6 +1649,8 @@ def setup(install_ocr=None):
                 # Use `sys.executable -m pip`, not bare `pip3`: on GitHub
                 # runners pip3 and the python3 running build.py can resolve to
                 # different interpreters / site-packages.
+                log("setup: installing PaddleOCR -- the paddlepaddle wheel is "
+                    "hundreds of MB, expect this step to take a few minutes")
                 if _sh_quiet(pip + " --break-system-packages "
                              "paddlepaddle 'paddleocr>=3.7'") != 0:
                     _sh_quiet(pip + " paddlepaddle 'paddleocr>=3.7'")
@@ -1668,16 +1698,16 @@ def setup(install_ocr=None):
             if os.path.exists(vp):
                 _run_quiet(["sudo", "ln", "-sf", vp, "/usr/local/bin/vncdotool"])
         if env("VM_ARCH") == "riscv64":
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "qemu-system-misc", "u-boot-qemu"], env=apt_env)
         if env("VM_ARCH") == "aarch64":
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "qemu-system-arm", "qemu-efi-aarch64"], env=apt_env)
         if env("VM_ARCH") == "s390x":
             # qemu-system-s390x ships in its own package on Ubuntu (NOT in
             # qemu-system-misc); its s390-ccw.img firmware comes with the
             # qemu-system-data dependency.
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "qemu-system-s390x"], env=apt_env)
         # A conf may ship its own QEMU build as a tarball (bin/ +
         # share/qemu layout, built against the runner's distro libs;
@@ -1693,7 +1723,7 @@ def setup(install_ocr=None):
         if env("VM_ARCH") == "sparc64":
             # qemu-system-sparc64 (sun4u + bundled OpenBIOS) ships in the
             # qemu-system-sparc package; no separate firmware package needed.
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "qemu-system-sparc"], env=apt_env)
         if env("VM_ARCH") in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
             # qemu-system-ppc64 (pseries machine) ships in the qemu-system-ppc
@@ -1701,7 +1731,7 @@ def setup(install_ocr=None):
             # with it, so no separate firmware package is needed. The GitHub
             # ubuntu runner image does NOT preinstall this, hence the explicit
             # apt-get (a local dev box may already have it from qemu-system).
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "qemu-system-ppc"], env=apt_env)
         # Make /dev/kvm usable by the current shell user. On GitHub Actions
         # runners (and most desktop distros) the device is mode crw-rw----
@@ -3303,11 +3333,25 @@ def main(argv):
         log(extra)
         # Same relaxed keepalive as the install step above: a long CPU burst
         # in the guest must not get the stdin-fed script killed mid-run.
+        #
+        # CHECK THE EXIT CODE. The desktop hooks (xfce.sh/gnome.sh/kde6.sh,
+        # openbsd vm_*.sh) run `set -e`, so a failed `pkg install` aborts them
+        # non-zero. build.py used to ignore that rc and export the image
+        # anyway: a transient "pkg: No packages available matching
+        # 'plasma6-plasma'" left the FreeBSD 15.1-kde6 v2.1.8 artifact with NO
+        # desktop, yet the build still went green and was published. Fail the
+        # build on any non-zero rc so a desktop-less image is never shipped.
+        # One failure is a failure -- no retry; rerun the job to recover from a
+        # transient repo-catalogue hiccup.
         with open(extra, "rb") as f:
-            subprocess.run(["ssh", "-o", "SendEnv=VM_RELEASE",
-                            "-o", "ServerAliveInterval=30",
-                            "-o", "ServerAliveCountMax=20",
-                            osname, "sh"], stdin=f)
+            rc = subprocess.run(["ssh", "-o", "SendEnv=VM_RELEASE",
+                                 "-o", "ServerAliveInterval=30",
+                                 "-o", "ServerAliveCountMax=20",
+                                 osname, "sh"], stdin=f).returncode
+        if rc != 0:
+            log("VM_EXTRA_SCRIPT %s FAILED rc=%d; aborting (refusing to ship "
+                "an image whose extra script did not complete)" % (extra, rc))
+            return 1
 
     shutdown_and_wait()
 

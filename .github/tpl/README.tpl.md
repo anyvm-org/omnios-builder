@@ -12,7 +12,7 @@ All the supported releases are here:
 
 {{RELEASE_TABLE}}
 
-
+{{DESKTOP_TABLE}}
 
 How to build:
 
