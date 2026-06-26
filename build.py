@@ -3051,6 +3051,12 @@ def _gen_enablessh_local():
         b64 = base64.b64encode(pub.encode("utf-8")).decode("ascii")
         f.write("echo '%s' | openssl base64 -d >>~/.ssh/authorized_keys\n\n\n"
                 % b64)
+        # The base64-roundtrip append above pipes through `openssl base64 -d`,
+        # which does NOT emit a trailing newline, so authorized_keys ends
+        # mid-line. Append one explicit newline right after the key writes so
+        # the file is well-formed (and any key appended later can't concatenate
+        # onto this one's line).
+        f.write("echo >>~/.ssh/authorized_keys\n\n")
         # sshd StrictModes (default) requires .ssh dir 700 + authorized_keys
         # 600. Set both explicitly -- belt-and-suspenders against a buggy
         # `chmod -R 600` in the per-builder enablessh.txt.
@@ -3352,6 +3358,41 @@ def main(argv):
             log("VM_EXTRA_SCRIPT %s FAILED rc=%d; aborting (refusing to ship "
                 "an image whose extra script did not complete)" % (extra, rc))
             return 1
+
+    # Show authorized_keys and assert it ends with a trailing newline -- here,
+    # on the live build VM, BEFORE shutdown/export, so it runs for EVERY image.
+    # The post-export verification boot below is gated on VM_RSYNC_PKG /
+    # VM_SSHFS_PKG (skipped for base-only images such as riscv64 / powerpc64),
+    # so a check placed there never runs for them; this spot is ungated. The
+    # build VM's disk IS the qcow2 about to be exported, so this is the shipped
+    # content. Best-effort on ssh: if the VM answers, print authorized_keys and
+    # fail the build when it does not end in a newline (_gen_enablessh_local's
+    # base64 re-append emits none; the explicit `echo >>` is meant to terminate
+    # it -- assert that held). If the VM is not ssh-reachable at this point
+    # (some console-only images), warn and continue rather than fail.
+    if _ssh_ready_check()[0]:
+        # Pull the whole authorized_keys back and judge it in Python rather
+        # than with a remote shell test. `cat` runs under any login shell; a
+        # POSIX `[ -z "$(...)" ]` does not -- FreeBSD roots default to tcsh,
+        # which can't parse `$(...)` and bailed with "Illegal variable name.",
+        # mis-failing a perfectly good file. The build VM's disk IS the qcow2
+        # about to be exported, so this is the shipped content. cat returns
+        # non-zero if the file is missing; empty stdout means an empty file;
+        # otherwise the trailing-byte test is unambiguous here.
+        r = subprocess.run(["ssh", osname, "cat ~/.ssh/authorized_keys"],
+                           capture_output=True)
+        ak = r.stdout
+        log("======Show authorized_keys: ")
+        log(ak.decode("utf-8", "replace").rstrip("\n"))
+        if r.returncode != 0 or not ak or not ak.endswith(b"\n"):
+            log("verification FAILED: ~/.ssh/authorized_keys is missing, empty, "
+                "or has no trailing newline (rc=%d, %d bytes)"
+                % (r.returncode, len(ak)))
+            return 1
+        log("verification OK: authorized_keys ends with a trailing newline")
+    else:
+        log("authorized_keys check: build VM not ssh-reachable here; skipping "
+            "(not failing -- some console-only images have no ssh at this point)")
 
     shutdown_and_wait()
 
