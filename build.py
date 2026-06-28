@@ -73,6 +73,27 @@ def sh(cmdstr):
     return subprocess.call(cmdstr, shell=True)
 
 
+def must_run(cmd, what=None):
+    """run() a command list but ABORT the build (clear FATAL + exit 1) on a
+    non-zero exit, instead of silently continuing on a half-done/corrupt result.
+    Use for irrecoverable pipeline steps (decompress, image convert, export)."""
+    cp = subprocess.run(cmd)
+    if cp.returncode != 0:
+        log("FATAL: %s (exit %d): %s" % (
+            what or "command failed", cp.returncode, " ".join(str(c) for c in cmd)))
+        sys.exit(1)
+    return cp
+
+
+def must_sh(cmdstr, what=None):
+    """sh() that ABORTS the build (FATAL + exit 1) on a non-zero exit."""
+    rc = subprocess.call(cmdstr, shell=True)
+    if rc != 0:
+        log("FATAL: %s (exit %d): %s" % (what or "command failed", rc, cmdstr))
+        sys.exit(1)
+    return 0
+
+
 def _run_quiet(cmd, **kw):
     """Run a noisy command (apt/brew/pip/etc.) silently; on non-zero exit dump
     the captured output so failures are still debuggable."""
@@ -1405,15 +1426,27 @@ def _http_get_stream(url, start=None, end=None):
 
 
 def _download_chunk(url, fpath, start, end):
+    expected = end - start + 1
     last_err = None
     for attempt in range(DL_ATTEMPTS):
         try:
+            written = 0
             with _http_get_stream(url, start, end) as resp, open(fpath, "r+b") as f:
                 f.seek(start)
                 while True:
                     buf = resp.read(DL_BUF)
                     if not buf: break
                     f.write(buf)
+                    written += len(buf)
+            # A short read (server/connection ends the range early without an
+            # error) must NOT count as success: download() pre-truncates the file
+            # to the full size, so a short chunk silently leaves zeros in its
+            # region and corrupts the image undetectably (the final size check
+            # always passes on the pre-sized file). Fail loudly so the retry loop
+            # -- and ultimately download()'s rc -- catches it.
+            if written != expected:
+                raise IOError("short chunk [%d-%d]: got %d of %d bytes" % (
+                    start, end, written, expected))
             return
         except Exception as e:
             last_err = e
@@ -1429,6 +1462,37 @@ def _download_single(url, fpath):
             f.write(buf)
 
 
+def _download_resume(url, fpath, total):
+    """Single-connection download that RESUMES via Range after a dropped or
+    short connection. Needed for mirrors like archive.netbsd.org that cap each
+    connection at a few MB and reset it mid-transfer (seen as ~9 MiB then SSL
+    UNEXPECTED_EOF / HTTP 402). Keeps re-requesting `Range: bytes=<got>-` until
+    the full size arrives; gives up only after DL_ATTEMPTS rounds with no
+    progress."""
+    open(fpath, "wb").close()   # start from an empty file
+    got = 0
+    stalls = 0
+    while got < total:
+        start = got
+        try:
+            with _http_get_stream(url, got, None) as resp, open(fpath, "r+b") as f:
+                f.seek(got)
+                while True:
+                    buf = resp.read(DL_BUF)
+                    if not buf: break
+                    f.write(buf)
+                    got += len(buf)
+        except Exception as e:
+            log("download stream error at %d/%d: %s (resuming)" % (got, total, e))
+        if got > start:
+            stalls = 0
+        else:
+            stalls += 1
+            if stalls >= DL_ATTEMPTS:
+                raise IOError("download stalled at %d/%d bytes" % (got, total))
+            time.sleep(2 * stalls)
+
+
 def download(link=None, fileout=None):
     """Multi-threaded HTTP downloader. 8 parallel Range requests when the
     server supports byte ranges; single-stream otherwise."""
@@ -1439,7 +1503,7 @@ def download(link=None, fileout=None):
     if size is None or not ranges_ok or size < DL_CHUNK_MIN:
         try: _download_single(link, fileout)
         except Exception as e:
-            log("download failed: %s" % e); return 1
+            log("FATAL: download failed: %s -- %s" % (link, e)); sys.exit(1)
         log("Download finished"); return 0
     with open(fileout, "wb") as f: f.truncate(size)
     chunk = (size + DL_THREADS - 1) // DL_THREADS
@@ -1457,15 +1521,31 @@ def download(link=None, fileout=None):
             try: fut.result()
             except Exception as e:
                 log("chunk failed: %s" % e); rc = 1
-    if rc == 0:
+    if rc != 0:
+        # Some mirrors (e.g. archive.netbsd.org) rate-limit / reject concurrent
+        # Range requests -- observed as "HTTP 402 Payment Required" on 7 of 8
+        # chunks, or each connection capped at ~9 MiB then reset. Retry the whole
+        # file as a single stream WITH resume, which stays under the per-client
+        # limit and reconnects through mid-transfer drops.
+        log("multi-threaded download failed; retrying single-stream with resume...")
         try:
-            actual = os.path.getsize(fileout)
-            if actual != size:
-                log("size mismatch: expected %d, got %d" % (size, actual))
-                rc = 1
-        except OSError: pass
-    if rc == 0: log("Download finished")
-    return rc
+            if size is not None and ranges_ok:
+                _download_resume(link, fileout, size)
+            else:
+                _download_single(link, fileout)
+        except Exception as e:
+            log("FATAL: download failed: %s -- %s" % (link, e))
+            sys.exit(1)
+    try:
+        actual = os.path.getsize(fileout)
+        if actual != size:
+            log("FATAL: download size mismatch for %s: expected %d, got %d" % (
+                link, size, actual))
+            sys.exit(1)
+    except OSError:
+        pass
+    log("Download finished")
+    return 0
 
 
 # ============================================================================
@@ -1794,7 +1874,8 @@ def createVM(isolink=None, sshport=None, disklink=None):
         download(isolink, iso)
         if isolink.endswith("bz2"):
             os.rename(iso, iso + ".bz2")
-            sh("bzip2 -dc %s > %s" % (shlex.quote(iso + ".bz2"), shlex.quote(iso)))
+            must_sh("bzip2 -dc %s > %s" % (shlex.quote(iso + ".bz2"), shlex.quote(iso)),
+                    "bzip2 decompress (corrupt download?)")
     if disklink:
         if not os.path.exists(vdi):
             download(disklink, vdi)
@@ -1819,7 +1900,7 @@ def createVMFromVHD(sshport=None):
     osname = _check_osname("createVMFromVHD")
     if not osname: return 1
     vhd = "%s.qcow2" % osname
-    run(["qemu-img", "resize", vhd, "+200G"])
+    must_run(["qemu-img", "resize", vhd, "+200G"], "qemu-img resize")
     write_state(osname, "sshport", sshport or "22")
     log("createVMFromVHD: %s prepared (sshport=%s). startVM will boot it."
         % (vhd, sshport))
@@ -2373,8 +2454,8 @@ def exportOVA(ova=None, qemu_args=None):
     # sparsified qcow2 at the release path. qemu-img refuses to use the same
     # file as both input and output, so we write to `ova` and swap below.
     # Peak disk during this step: src + ova (~2x the qcow2 size, briefly).
-    run(["qemu-img", "convert", "-O", "qcow2", "-S", "4k",
-         "-o", "preallocation=off", src, ova])
+    must_run(["qemu-img", "convert", "-O", "qcow2", "-S", "4k",
+              "-o", "preallocation=off", src, ova], "qemu-img convert (export)")
     # Stage 2: drop the original work disk and move the converted one into
     # its place. After this we hold a single qcow2 file (~1x), and the
     # downstream verification VM (started later in main()) still boots from
@@ -2389,8 +2470,10 @@ def exportOVA(ova=None, qemu_args=None):
     # `<output>.qcow2.zst[.N]`. split keeps any future >2GB build's chunks
     # under GitHub's release-asset size cap; single-chunk case renames
     # .zst.0 -> .zst so consumers just `zstd -d` the one file.
-    sh("zstd -c %s | split -b 2000M -d -a 1 - %s"
-       % (shlex.quote(src), shlex.quote(ova + ".zst.")))
+    # bash + pipefail so a zstd failure mid-pipe aborts (a bare pipe would
+    # report only split's exit and silently ship a truncated .zst).
+    must_run(["bash", "-c", "set -o pipefail; zstd -c %s | split -b 2000M -d -a 1 - %s"
+              % (shlex.quote(src), shlex.quote(ova + ".zst."))], "zstd compress")
     run(["ls", "-lah"])
     try: os.rename(ova + ".zst.0", ova + ".zst")
     except OSError: pass
@@ -2988,43 +3071,50 @@ def _prep_vhd_disk(link):
     osname = env("VM_OS_NAME")
     qcow = "%s.qcow2" % osname
     if os.path.exists(qcow): return
+    # download() aborts the build itself on an unrecoverable download; every
+    # decompress / image-convert below uses must_run/must_sh so a failure there
+    # also aborts (FATAL + exit 1) rather than silently leaving a corrupt qcow2
+    # that only blows up much later at boot.
     if link.endswith("img.gz"):
         img = "%s.img" % osname
         if not os.path.exists(img):
             try: os.remove(img + ".gz")
             except OSError: pass
             download(link, img + ".gz")
-            sh("gunzip -c %s.gz > %s" % (shlex.quote(img), shlex.quote(img)))
-        run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
-             "-o", "preallocation=off", img, qcow])
+            must_sh("gunzip -c %s.gz > %s" % (shlex.quote(img), shlex.quote(img)),
+                    "gunzip %s.gz (corrupt download?)" % img)
+        must_run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
+                  "-o", "preallocation=off", img, qcow], "qemu-img convert")
     elif link.endswith("img.zst"):
         img = "%s.img" % osname
         if not os.path.exists(img):
             try: os.remove(img + ".zst")
             except OSError: pass
             download(link, img + ".zst")
-            run(["zstd", "-f", "-d", img + ".zst", "-o", img])
-        run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
-             "-o", "preallocation=off", img, qcow])
+            must_run(["zstd", "-f", "-d", img + ".zst", "-o", img], "zstd decompress")
+        must_run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
+                  "-o", "preallocation=off", img, qcow], "qemu-img convert")
     elif link.endswith(".img"):
         tmp = "%s.download.img" % osname
         if not os.path.exists(tmp):
             download(link, tmp)
-        run(["qemu-img", "convert", "-O", "qcow2", "-o", "preallocation=off", tmp, qcow])
+        must_run(["qemu-img", "convert", "-O", "qcow2", "-o", "preallocation=off",
+                  tmp, qcow], "qemu-img convert")
         try: os.remove(tmp)
         except OSError: pass
     elif link.endswith(".qcow2"):
         tmp = "%s.download.qcow2" % osname
         if not os.path.exists(tmp):
             download(link, tmp)
-        run(["qemu-img", "convert", "-O", "qcow2", "-o", "preallocation=off", tmp, qcow])
+        must_run(["qemu-img", "convert", "-O", "qcow2", "-o", "preallocation=off",
+                  tmp, qcow], "qemu-img convert")
         try: os.remove(tmp)
         except OSError: pass
     else:
         xz = qcow + ".xz"
         if not os.path.exists(xz):
             download(link, xz)
-        run(["xz", "-d", "-T", "0", "--verbose", xz])
+        must_run(["xz", "-d", "-T", "0", "--verbose", xz], "xz decompress")
 
 
 def _gen_enablessh_local():
