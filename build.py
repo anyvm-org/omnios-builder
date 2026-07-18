@@ -3422,8 +3422,6 @@ def main(argv):
             # not silently tolerated.
             return 1
 
-    run_hook("finalize")
-
     extra = env("VM_EXTRA_SCRIPT")
     if extra:
         log(extra)
@@ -3448,6 +3446,16 @@ def main(argv):
             log("VM_EXTRA_SCRIPT %s FAILED rc=%d; aborting (refusing to ship "
                 "an image whose extra script did not complete)" % (extra, rc))
             return 1
+
+    # finalize is the LAST in-guest hook point: it runs AFTER VM_EXTRA_SCRIPT
+    # (it used to run just before it) so image-slimming cleanup in a
+    # finalize hook -- dropping package caches, TRIM/zero-fill of freed
+    # blocks so the export sparsify can reclaim them -- also covers the
+    # desktop variants' package churn. The desktop scripts never reboot the
+    # guest (their "reboot to apply" is the exported image's first boot), so
+    # ssh is still up here. Best-effort by design: run_hook ignores the
+    # guest rc, so a failed cleanup never sinks an otherwise-good build.
+    run_hook("finalize")
 
     # Show authorized_keys and assert it ends with a trailing newline -- here,
     # on the live build VM, BEFORE shutdown/export, so it runs for EVERY image.
