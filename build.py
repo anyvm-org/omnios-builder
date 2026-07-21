@@ -139,14 +139,19 @@ def _sh_loud(cmdstr):
     return rc
 
 
-# All build-GENERATED files -- state (pid/ports/cmdline), logs, the working
-# qcow2, download intermediates, the web console (index.html/screen.png), and
-# the final release artifacts (<output>.qcow2.zst + sidecars) -- live under
-# WORKDIR so the builder repo root stays clean. INPUTS (conf/, hooks/, files/,
-# .github/, the conf's VM_* paths) stay at the repo root and are read from
-# there; they are never routed through wf(). The CI upload step
-# (base-builder/.github/tpl/build.tpl.yml) picks the release artifacts up from
-# this same WORKDIR -- keep the two in lock-step.
+# Most build-GENERATED files -- state (pid/ports/cmdline), logs, the working
+# qcow2, download intermediates, and the final release artifacts
+# (<output>.qcow2.zst + sidecars) -- live under WORKDIR so the builder repo
+# root stays clean. INPUTS (conf/, hooks/, files/, .github/, the conf's VM_*
+# paths) stay at the repo root and are read from there; they are never routed
+# through wf(). The CI upload step (base-builder/.github/tpl/build.tpl.yml)
+# picks the release artifacts up from this same WORKDIR -- keep the two in
+# lock-step.
+# EXCEPTION: the web-console files (index.html / screen.png / screen.txt /
+# _screenText.txt / _stopvnc.txt) stay at the repo root, because the same
+# http.server that publishes them ALSO serves guests their INPUT files during
+# install (e.g. ghostbsd fetches conf/pcinstall.cfg from it). Serving WORKDIR
+# would 404 those repo-root inputs, so the console files live alongside them.
 WORKDIR = "build"
 
 
@@ -2273,7 +2278,7 @@ def _write_index_html(text):
             "<body onclick='stop()' style='background-color:grey;'>\n\n"
             "<img src='screen.png' alt='Screen'>\n\n<br>\n<pre>\n"
             % (env("VM_OS_NAME") or "", env("VM_RELEASE")))
-    with open(wf("index.html"), "w") as f:
+    with open("index.html", "w") as f:
         f.write(head); f.write(text); f.write("</pre></body></html>\n")
 
 
@@ -2291,7 +2296,7 @@ def _screen_text_value(img=None):
             try: os.remove(png)
             except OSError: pass
     if img:
-        with open(wf("screen.txt"), "w") as f:
+        with open("screen.txt", "w") as f:
             f.write(text)
         _write_index_html(text)
     return text
@@ -2393,7 +2398,7 @@ def waitForText(text=None, sec="", hook=None):
                 log("waitForText hook raised: %s" % e)
         time.sleep(3)
         screen = _screen_text_value(None)
-        with open(wf("_screenText.txt"), "w") as f:
+        with open("_screenText.txt", "w") as f:
             f.write(screen)
         # Dump only what has never been printed before: re-printing the whole
         # 50-line window every 3 s buried the build log in repetition. The
@@ -2422,16 +2427,19 @@ def startWeb(needOCR=None):
     daemon thread (was a detached subprocess)."""
     osname = _check_osname("startWeb")
     if not osname: return 1
-    try: os.remove(wf("_stopvnc.txt"))
+    try: os.remove("_stopvnc.txt")
     except OSError: pass
-    # The HTTP server can stay as a detached subprocess. It serves WORKDIR
-    # (not the repo root) via --directory, so the screenshots / OCR text /
-    # index.html we drop into WORKDIR are the console content.
-    subprocess.Popen([sys.executable, "-m", "http.server", "--directory", WORKDIR],
+    # The HTTP server serves the repo ROOT (cwd), NOT WORKDIR: besides the web
+    # console (index.html / screen.png), guests fetch their INPUT files from it
+    # during install -- e.g. ghostbsd's host_installOpts.py does
+    # `fetch http://192.168.122.1:8000/conf/pcinstall.cfg`. Those inputs live at
+    # the repo root, so the console files stay at the root too (they are small
+    # and transient; the big generated files still go under WORKDIR via wf()).
+    subprocess.Popen([sys.executable, "-m", "http.server"],
                     stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL,
                     start_new_session=True)
-    if not os.path.exists(wf("index.html")):
-        with open(wf("index.html"), "w") as f:
+    if not os.path.exists("index.html"):
+        with open("index.html", "w") as f:
             f.write("<!DOCTYPE html>\n<html>\n<head>\n<title>%s</title>\n"
                     "<meta http-equiv='refresh' content='1'>\n</head>\n"
                     "<body style='background-color:grey;'>\n\n"
@@ -2439,9 +2447,9 @@ def startWeb(needOCR=None):
 
     def loop():
         while not _startweb_stop.is_set():
-            if not os.path.exists(wf("_stopvnc.txt")):
+            if not os.path.exists("_stopvnc.txt"):
                 try:
-                    _screen_text_value(wf("screen.png"))
+                    _screen_text_value("screen.png")
                 except Exception:
                     pass
             time.sleep(3)
@@ -2452,7 +2460,7 @@ def startWeb(needOCR=None):
 
 
 def pauseVNC():
-    open(wf("_stopvnc.txt"), "w").close()
+    open("_stopvnc.txt", "w").close()
     return 0
 
 
@@ -3431,10 +3439,15 @@ def _gen_enablessh_local():
     pub_path = idrsa + ".pub"
     pub = open(pub_path).read().rstrip("\n")
 
-    try: os.remove(wf("enablessh.local"))
+    # enablessh.local stays at the repo root (NOT under WORKDIR): several
+    # per-builder enablessh hooks read it by bare name -- ghostbsd
+    # `open("enablessh.local")`, blissos/hurd/ubuntu `ssh ... sh <enablessh.local`,
+    # haiku `inputFile("enablessh.local")`. Keeping it at the root avoids
+    # touching every one of those custom hooks. It is small and transient.
+    try: os.remove("enablessh.local")
     except OSError: pass
-    shutil.copy("enablessh.txt", wf("enablessh.local"))
-    with open(wf("enablessh.local"), "a") as f:
+    shutil.copy("enablessh.txt", "enablessh.local")
+    with open("enablessh.local", "a") as f:
         f.write("echo '%s' >>~/.ssh/authorized_keys\n\n\n\n" % pub)
         b64 = base64.b64encode(pub.encode("utf-8")).decode("ascii")
         f.write("echo '%s' | openssl base64 -d >>~/.ssh/authorized_keys\n\n\n"
@@ -3459,7 +3472,7 @@ def _gen_enablessh_local():
         f.write("grep -q '^StrictModes no' /etc/ssh/sshd_config || "
                 "echo 'StrictModes no' >> /etc/ssh/sshd_config\n")
         f.write("chmod u-w /etc/ssh/sshd_config 2>/dev/null || true\n\n\n")
-    log(open(wf("enablessh.local")).read())
+    log(open("enablessh.local").read())
 
 
 def _enable_ssh_root_branch(sshport):
@@ -3468,7 +3481,7 @@ def _enable_ssh_root_branch(sshport):
     (the guest's 192.168.122.x is not host-reachable)."""
     vmip = getVMIP()
     log("guest slirp ip: %s (connecting via hostfwd 127.0.0.1:%s)" % (vmip, sshport))
-    with open(wf("enablessh.local"), "rb") as inp:
+    with open("enablessh.local", "rb") as inp:
         subprocess.run(
             ["sshpass", "-p", env("VM_ROOT_PASSWORD"), "ssh", "-p", str(sshport),
              "-o", "StrictHostKeyChecking=no",
@@ -3506,11 +3519,11 @@ def _enable_ssh_console_branch():
     if run_hook("enableNetwork"):
         screenText(); time.sleep(60)
     if env("VM_USE_NC_ENABLE_SSH"):
-        inputFileNC(wf("enablessh.local"))
+        inputFileNC("enablessh.local")
     elif env("VM_USE_BASH_ENABLE_SSH"):
-        inputFileBash(wf("enablessh.local"))
+        inputFileBash("enablessh.local")
     else:
-        inputFile(wf("enablessh.local"))
+        inputFile("enablessh.local")
     time.sleep(60); screenText(); time.sleep(10)
     inputKeys("enter"); time.sleep(2)
     inputKeys("enter"); time.sleep(2)
