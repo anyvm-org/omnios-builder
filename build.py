@@ -139,8 +139,24 @@ def _sh_loud(cmdstr):
     return rc
 
 
+# All build-GENERATED files -- state (pid/ports/cmdline), logs, the working
+# qcow2, download intermediates, the web console (index.html/screen.png), and
+# the final release artifacts (<output>.qcow2.zst + sidecars) -- live under
+# WORKDIR so the builder repo root stays clean. INPUTS (conf/, hooks/, files/,
+# .github/, the conf's VM_* paths) stay at the repo root and are read from
+# there; they are never routed through wf(). The CI upload step
+# (base-builder/.github/tpl/build.tpl.yml) picks the release artifacts up from
+# this same WORKDIR -- keep the two in lock-step.
+WORKDIR = "build"
+
+
+def wf(name):
+    """Path of a build-generated file, kept under WORKDIR."""
+    return os.path.join(WORKDIR, name)
+
+
 def state(osname, suffix):
-    return "%s.%s" % (osname, suffix)
+    return wf("%s.%s" % (osname, suffix))
 
 
 def read_state(osname, suffix, default=""):
@@ -419,6 +435,27 @@ def hvf_supported():
 
 def kvm_ok():
     return os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK)
+
+
+def host_nested_amd_with_avx512():
+    """True if the host is an AMD CPU that exposes AVX512 AND is itself
+    running under a hypervisor (nested virtualization). Mirrors
+    anyvm.py:host_nested_amd_with_avx512 (same rationale): nested AMD-V --
+    e.g. KVM inside WSL2 / Hyper-V -- mishandles the L2 guest's AVX512
+    XSAVE state, so a guest whose glibc selects the AVX512 string/memory
+    routines randomly SIGSEGVs. The x86 KVM branch drops just avx512f from
+    -cpu host in that exact case; bare-metal hosts have no 'hypervisor'
+    flag and keep full AVX512."""
+    if platform.system() != "Linux":
+        return False
+    try:
+        with open("/proc/cpuinfo") as f:
+            info = f.read()
+    except Exception:
+        return False
+    return ("AuthenticAMD" in info
+            and "hypervisor" in info
+            and "avx512f" in info)
 
 
 def qemu_accel():
@@ -716,13 +753,13 @@ def build_qemu_args(media_kind=None, media_path=None):
     """Build the full QEMU argv. media_kind is None / 'cdrom' / 'disk'."""
     osname = env("VM_OS_NAME")
     arch = env("VM_ARCH") or "x86_64"
-    qcow = "%s.qcow2" % osname
+    qcow = wf("%s.qcow2" % osname)
     sshport = read_state(osname, "sshport") or "22"
 
     monport = free_port(4444, 4544); write_state(osname, "monport", monport)
     serport = free_port(7000, 9000); write_state(osname, "serport", serport)
     vncport = free_port(5900, 5999); write_state(osname, "vncport", vncport)
-    serlog = "%s.serial.log" % osname
+    serlog = serial_log(osname)
     try: os.remove(serlog)
     except OSError: pass
 
@@ -755,9 +792,20 @@ def build_qemu_args(media_kind=None, media_path=None):
     # slirp DHCP pinned to .254 (see SLIRP_EXPECTED_GUEST_IP for rationale).
     # hostfwd target is the explicit guest IP so port forwarding never races
     # the guest's DHCP-bound state.
-    a += ["-netdev", "user,id=net0,net=192.168.122.0/24,host=192.168.122.1,"
-          "dhcpstart=192.168.122.254,ipv6=off,"
-          "hostfwd=tcp:127.0.0.1:%s-192.168.122.254:22" % sshport]
+    #
+    # VM_TRANSPORT=telnet (plan9): the guest has no sshd, the build drives it
+    # over telnetd instead, so the "ssh" hostfwd points at guest port 23. An
+    # optional VM_9P_PORT adds a second forward to the guest's exportfs 9P
+    # listener on 564 (used to move files in/out without scp).
+    guest_ctl_port = "23" if env("VM_TRANSPORT") == "telnet" else "22"
+    netdev = ("user,id=net0,net=192.168.122.0/24,host=192.168.122.1,"
+              "dhcpstart=192.168.122.254,ipv6=off,"
+              "hostfwd=tcp:127.0.0.1:%s-192.168.122.254:%s"
+              % (sshport, guest_ctl_port))
+    if env("VM_9P_PORT"):
+        netdev += (",hostfwd=tcp:127.0.0.1:%s-192.168.122.254:564"
+                   % env("VM_9P_PORT"))
+    a += ["-netdev", netdev]
     # virtio-rng-pci for all guests EXCEPT solaris, sparc64 and s390x --
     # Solaris does not have a virtio-rng driver and the unrecognized device
     # disrupts early boot; the QEMU sun4u (sparc64) machine has no free PCI
@@ -783,8 +831,8 @@ def build_qemu_args(media_kind=None, media_path=None):
         a += ["-bios", env("VM_BIOS")]
 
     if arch == "aarch64":
-        efi = "%s-QEMU_EFI.fd" % osname
-        varsf = "%s-QEMU_EFI_VARS.fd" % osname
+        efi = wf("%s-QEMU_EFI.fd" % osname)
+        varsf = wf("%s-QEMU_EFI_VARS.fd" % osname)
         code_src = _find_aarch64_efi_code(resolve_qemu_bin())
         if not os.path.exists(efi):
             if not code_src:
@@ -1043,7 +1091,20 @@ def build_qemu_args(media_kind=None, media_path=None):
 
     else:
         # x86_64 (and any other PC-class arch).
-        a += ["-machine", "pc,accel=%s,hpet=off,smm=off,graphics=on,vmport=off,usb=on" % accel]
+        pc_mopts = "pc,accel=%s,hpet=off,smm=off,graphics=on,vmport=off,usb=on" % accel
+        if osname == "hurd":
+            # gnumach requires the HPET: hpet_init asserts hpet_addr != 0 and
+            # panics the kernel when the machine is launched with hpet=off.
+            # The amd64 build additionally needs the q35 machine: on i440fx
+            # 'pc', rumpdisk's piix IDE DMA cannot address 64-bit physical
+            # pages, so >= 3584 MB RAM fails root mounting with "ext2fs:
+            # part:1:device:wd0: Input/output error" (bug-hurd 2025-11
+            # msg00017; -M q35 is the upstream-confirmed fix). i386 keeps pc
+            # (in-kernel gnumach IDE, 2 GB mem cap).
+            hurd_mtype = "pc" if arch == "i386" else "q35"
+            pc_mopts = ("%s,accel=%s,smm=off,graphics=on,vmport=off,usb=on"
+                        % (hurd_mtype, accel))
+        a += ["-machine", pc_mopts]
         # Mirrors anyvm.py:5413-5439.
         if accel == "kvm":
             if osname == "dragonflybsd":
@@ -1057,6 +1118,12 @@ def build_qemu_args(media_kind=None, media_path=None):
                 cpu = "Broadwell-v4,+hypervisor,+invtsc"
             else:
                 cpu = "host,kvm=on,l3-cache=on,+hypervisor,migratable=no,+invtsc"
+                if host_nested_amd_with_avx512():
+                    # See host_nested_amd_with_avx512(): nested AMD-V corrupts
+                    # guest AVX512 XSAVE state; drop just avx512f so glibc
+                    # falls back to its AVX2 paths.
+                    cpu += ",-avx512f"
+                    log("Nested AMD KVM detected: dropping AVX512 from -cpu host")
         elif accel == "hvf":
             cpu = "host,+rdrand,+rdseed"
         else:
@@ -1190,6 +1257,11 @@ def _profile_machine():
     if arch in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
         return "pseries", ("usb=off,cap-cfpc=broken,cap-sbbc=broken,"
                            "cap-ibs=broken,cap-ccf-assist=off")
+    if osname == "hurd":
+        # gnumach requires the HPET; amd64 additionally needs q35 (see the
+        # hurd branch in build_qemu_args).
+        return ("pc" if arch == "i386" else "q35",
+                "smm=off,graphics=on,vmport=off,usb=on")
     return "pc", "hpet=off,smm=off,graphics=on,vmport=off,usb=on"
 
 
@@ -1263,7 +1335,9 @@ def _profile_balloon():
     except NetBSD (its GENERIC64 cannot drive the PCI balloon); never on aarch64
     / s390x / sparc64 / pseries."""
     arch = env("VM_ARCH") or "x86_64"
-    if arch == "x86_64":
+    if arch in ("x86_64", "i386"):
+        # i386 (hurd) runs through the same PC-class else-branch of
+        # build_qemu_args(), which attaches the balloon unconditionally.
         return True
     if arch == "riscv64" and env("VM_OS_NAME") != "netbsd":
         return True
@@ -1307,6 +1381,12 @@ def build_guest_profile():
     if arch == "sparc64":
         mem_cap = 1024 if osname == "openbsd" else 2048
         cpu_cap = 1
+    if osname == "hurd":
+        # Stock gnumach is uniprocessor (SMP is an experimental add-on
+        # package), and the 32-bit i386 kernel cannot address big RAM.
+        cpu_cap = 1
+        if arch == "i386":
+            mem_cap = 2048
     return {
         "anyvm_profile_version": GUEST_PROFILE_VERSION,
         "os": osname,
@@ -1329,6 +1409,10 @@ def build_guest_profile():
         # rtc_base and anyvm.py's.
         "rtc_base": "localtime" if osname in ("windows", "haiku") else "utc",
         "console": bool(env("VM_USE_CONSOLE_BUILD")),
+        # Remote-exec channel into the guest: "ssh" for everything except
+        # VM_TRANSPORT=telnet guests (plan9: telnetd on 23, exportfs 9P on
+        # 564, no sshd at all).
+        "transport": "telnet" if env("VM_TRANSPORT") == "telnet" else "ssh",
         "mem_cap_mb": mem_cap,
         "cpu_cap": cpu_cap,
     }
@@ -1362,14 +1446,15 @@ def launch_qemu(media_kind=None, media_path=None):
         f.write(" ".join(cmd) + "\n")
     log("Launching QEMU for %s:" % osname)
     log(" ".join(cmd))
-    logf = open("%s.qemu.log" % osname, "ab")
+    qemulog = wf("%s.qemu.log" % osname)
+    logf = open(qemulog, "ab")
     p = subprocess.Popen(cmd, stdin=DEVNULL, stdout=logf, stderr=logf,
                          start_new_session=True)
     write_state(osname, "pid", p.pid)
     time.sleep(1)
     if p.poll() is not None:
-        log("QEMU failed to start for %s; tail of %s.qemu.log:" % (osname, osname))
-        log(tail_file("%s.qemu.log" % osname, 50))
+        log("QEMU failed to start for %s; tail of %s:" % (osname, qemulog))
+        log(tail_file(qemulog, 50))
         return 1
     log("QEMU started: pid=%d vnc=127.0.0.1::%s monitor=%s serial=%s"
         % (p.pid, read_state(osname, "vncport"), read_state(osname, "monport"),
@@ -1567,7 +1652,7 @@ def download(link=None, fileout=None):
 def serial_log(osname):
     """The QEMU-written serial log file. Set up by build_qemu_args() via
     `-chardev socket,...,logfile=...` and truncated each launch_qemu()."""
-    return "%s.serial.log" % osname
+    return wf("%s.serial.log" % osname)
 
 
 _console_sessions = {}     # osname -> ConsoleSession
@@ -1866,10 +1951,10 @@ def setup(install_ocr=None):
 def createVM(isolink=None, sshport=None, disklink=None):
     osname = _check_osname("createVM")
     if not osname: return 1
-    vdi = "%s.qcow2" % osname
-    iso = "%s.iso" % osname
+    vdi = wf("%s.qcow2" % osname)
+    iso = wf("%s.iso" % osname)
     if isolink.endswith("img"):
-        iso = "%s.img" % osname
+        iso = wf("%s.img" % osname)
     if not os.path.exists(iso):
         download(isolink, iso)
         if isolink.endswith("bz2"):
@@ -1899,7 +1984,7 @@ def createVM(isolink=None, sshport=None, disklink=None):
 def createVMFromVHD(sshport=None):
     osname = _check_osname("createVMFromVHD")
     if not osname: return 1
-    vhd = "%s.qcow2" % osname
+    vhd = wf("%s.qcow2" % osname)
     must_run(["qemu-img", "resize", vhd, "+200G"], "qemu-img resize")
     write_state(osname, "sshport", sshport or "22")
     log("createVMFromVHD: %s prepared (sshport=%s). startVM will boot it."
@@ -1956,7 +2041,7 @@ def _serial_tail_line(window=4096):
     Used to show what the guest is actually doing during long waits."""
     osname = env("VM_OS_NAME")
     if not osname: return 0, ""
-    path = "%s.serial.log" % osname
+    path = serial_log(osname)
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
@@ -2007,7 +2092,9 @@ def _wait_vm_down(what="VM", poll=20, max_seconds=1800):
         # sparc64 have no working QEMU poweroff, so `shutdown -p` ends at "has
         # halted / press any key to reboot" with QEMU still running. Treat that
         # as down and force-kill at once rather than burning the full timeout.
-        if re.search(r"has halted|press any key to reboot", tail, re.I):
+        # "done halting" is plan9/9front's fshalt banner: hjfs has ended and
+        # the CPU sits in a halt loop with QEMU still alive.
+        if re.search(r"has halted|press any key to reboot|done halting", tail, re.I):
             log("%s: guest halted without powering off QEMU; force-killing" % what)
             destroyVM()
             return
@@ -2044,11 +2131,11 @@ def clearVM():
     if isRunning() == 0:
         destroyVM()
     closeConsole()
-    for f in ["%s.qcow2" % osname, "%s.img" % osname, "%s.pid" % osname,
-              "%s.monport" % osname, "%s.serport" % osname, "%s.sshport" % osname,
-              "%s.vncport" % osname,
-              "%s.serial.log" % osname, "%s.qemu.log" % osname, "%s.cmdline" % osname,
-              "%s-QEMU_EFI.fd" % osname, "%s-QEMU_EFI_VARS.fd" % osname]:
+    for f in [wf("%s.qcow2" % osname), wf("%s.img" % osname), wf("%s.pid" % osname),
+              wf("%s.monport" % osname), wf("%s.serport" % osname), wf("%s.sshport" % osname),
+              wf("%s.vncport" % osname),
+              wf("%s.serial.log" % osname), wf("%s.qemu.log" % osname), wf("%s.cmdline" % osname),
+              wf("%s-QEMU_EFI.fd" % osname), wf("%s-QEMU_EFI_VARS.fd" % osname)]:
         try: os.remove(f)
         except OSError: pass
     try: os.remove(os.path.join(HOME, ".ssh", "known_hosts"))
@@ -2186,7 +2273,7 @@ def _write_index_html(text):
             "<body onclick='stop()' style='background-color:grey;'>\n\n"
             "<img src='screen.png' alt='Screen'>\n\n<br>\n<pre>\n"
             % (env("VM_OS_NAME") or "", env("VM_RELEASE")))
-    with open("index.html", "w") as f:
+    with open(wf("index.html"), "w") as f:
         f.write(head); f.write(text); f.write("</pre></body></html>\n")
 
 
@@ -2204,7 +2291,7 @@ def _screen_text_value(img=None):
             try: os.remove(png)
             except OSError: pass
     if img:
-        with open("screen.txt", "w") as f:
+        with open(wf("screen.txt"), "w") as f:
             f.write(text)
         _write_index_html(text)
     return text
@@ -2306,7 +2393,7 @@ def waitForText(text=None, sec="", hook=None):
                 log("waitForText hook raised: %s" % e)
         time.sleep(3)
         screen = _screen_text_value(None)
-        with open("_screenText.txt", "w") as f:
+        with open(wf("_screenText.txt"), "w") as f:
             f.write(screen)
         # Dump only what has never been printed before: re-printing the whole
         # 50-line window every 3 s buried the build log in repetition. The
@@ -2335,15 +2422,16 @@ def startWeb(needOCR=None):
     daemon thread (was a detached subprocess)."""
     osname = _check_osname("startWeb")
     if not osname: return 1
-    try: os.remove("_stopvnc.txt")
+    try: os.remove(wf("_stopvnc.txt"))
     except OSError: pass
-    # The HTTP server can stay as a detached subprocess: it shares cwd with us
-    # and only serves whatever screenshots / OCR text we drop into the dir.
-    subprocess.Popen([sys.executable, "-m", "http.server"],
+    # The HTTP server can stay as a detached subprocess. It serves WORKDIR
+    # (not the repo root) via --directory, so the screenshots / OCR text /
+    # index.html we drop into WORKDIR are the console content.
+    subprocess.Popen([sys.executable, "-m", "http.server", "--directory", WORKDIR],
                     stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL,
                     start_new_session=True)
-    if not os.path.exists("index.html"):
-        with open("index.html", "w") as f:
+    if not os.path.exists(wf("index.html")):
+        with open(wf("index.html"), "w") as f:
             f.write("<!DOCTYPE html>\n<html>\n<head>\n<title>%s</title>\n"
                     "<meta http-equiv='refresh' content='1'>\n</head>\n"
                     "<body style='background-color:grey;'>\n\n"
@@ -2351,9 +2439,9 @@ def startWeb(needOCR=None):
 
     def loop():
         while not _startweb_stop.is_set():
-            if not os.path.exists("_stopvnc.txt"):
+            if not os.path.exists(wf("_stopvnc.txt")):
                 try:
-                    _screen_text_value("screen.png")
+                    _screen_text_value(wf("screen.png"))
                 except Exception:
                     pass
             time.sleep(3)
@@ -2364,7 +2452,7 @@ def startWeb(needOCR=None):
 
 
 def pauseVNC():
-    open("_stopvnc.txt", "w").close()
+    open(wf("_stopvnc.txt"), "w").close()
     return 0
 
 
@@ -2448,7 +2536,7 @@ def exportOVA(ova=None, qemu_args=None):
     if not osname: return 1
     if not ova:
         log("Usage: exportOVA out.qcow2 [out.qemu]"); return 1
-    src = "%s.qcow2" % osname
+    src = wf("%s.qcow2" % osname)
     log(src)
     # Stage 1: qemu-img convert the work disk into a fresh, compacted /
     # sparsified qcow2 at the release path. qemu-img refuses to use the same
@@ -2867,6 +2955,159 @@ def conf_load(path):
 # (M) Build pipeline (was build.sh)
 # ============================================================================
 
+# ============================================================================
+# (H2) telnet transport -- VM_TRANSPORT=telnet
+#
+# For guests with no sshd at all (plan9/9front) the build drives the guest
+# through its telnetd (baked to listen with no auth, reachable only via the
+# slirp hostfwd on 127.0.0.1). Command lines are sent as-is; completion is
+# judged by settle time and callers grep the returned transcript for their
+# own markers. There is no exit-status channel -- a hook that needs one must
+# have the guest echo a marker (rc: `echo done-$status`).
+# ============================================================================
+
+def _telnet_eat_iac(sock, data, out):
+    """Consume telnet IAC negotiation in `data`, refusing every option, and
+    append the plain bytes to `out`."""
+    IAC, SE, SB = 255, 240, 250
+    WILL, WONT, DO, DONT = 251, 252, 253, 254
+    i, n = 0, len(data)
+    while i < n:
+        b = data[i]
+        if b != IAC:
+            out.append(b)
+            i += 1
+            continue
+        if i + 1 >= n:
+            break
+        cmd = data[i + 1]
+        if cmd in (DO, DONT, WILL, WONT) and i + 2 < n:
+            opt = data[i + 2]
+            try:
+                if cmd == DO:
+                    sock.sendall(bytes([IAC, WONT, opt]))
+                elif cmd == WILL:
+                    sock.sendall(bytes([IAC, DONT, opt]))
+            except OSError:
+                pass
+            i += 3
+        elif cmd == SB:
+            j = i + 2
+            while j + 1 < n and not (data[j] == IAC and data[j + 1] == SE):
+                j += 1
+            i = j + 2
+        elif cmd == IAC:
+            out.append(IAC)
+            i += 2
+        else:
+            i += 2
+
+
+def telnet_exec(cmds, settle=2.0, port=None):
+    """Run command lines in the guest over telnet. `cmds` is a list of
+    command strings (sent one by one, each followed by CRLF, waiting
+    `settle` seconds after each). Returns (connected, transcript_text):
+    connected is False when the TCP connect failed or the peer closed
+    mid-session; transcript_text is everything the guest printed."""
+    osname = env("VM_OS_NAME") or ""
+    if port is None:
+        try:
+            port = int(read_state(osname, "sshport") or "23")
+        except ValueError:
+            port = 23
+    out = bytearray()
+    try:
+        sock = socket.create_connection(("127.0.0.1", int(port)), 10)
+    except OSError:
+        return False, ""
+    alive = True
+
+    def _read_for(seconds):
+        end = time.time() + seconds
+        sock.settimeout(0.5)
+        while time.time() < end:
+            try:
+                data = sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                return False
+            if not data:
+                return False
+            _telnet_eat_iac(sock, data, out)
+        return True
+
+    alive = _read_for(min(settle, 2.0))
+    for c in cmds:
+        if not alive:
+            break
+        try:
+            sock.sendall(c.encode("utf-8", "replace") + b"\r\n")
+        except OSError:
+            alive = False
+            break
+        alive = _read_for(settle)
+    try:
+        sock.close()
+    except OSError:
+        pass
+    return alive, out.decode("utf-8", "replace")
+
+
+def _telnet_ready_check():
+    """One telnet probe: connect, run a marker echo, look for the marker in
+    the output. The quoted split in the sent line keeps the guest's echo of
+    the command itself from matching."""
+    ok, text = telnet_exec(["echo anyvm''-ready"], settle=2.0)
+    return ok and ("anyvm-ready" in text)
+
+
+def _wait_telnet(max_retries=100, restart_cb=None):
+    """Poll the guest's telnetd through the hostfwd port until it answers the
+    marker probe; optional restart_cb runs once on terminal failure. Includes
+    the same hostfwd-IP guard as _wait_ssh (stale DHCP lease -> rewrite the
+    forward via the monitor)."""
+    osname = env("VM_OS_NAME") or ""
+    sshport_str = read_state(osname, "sshport") or "23"
+    try:
+        sshport = int(sshport_str)
+    except ValueError:
+        sshport = 23
+    retry = 0
+    restarted = False
+    guard_done = False
+    while True:
+        if _telnet_ready_check():
+            break
+        log("telnet is not ready, just wait.")
+        if not guard_done:
+            actual = detect_guest_ip(osname)
+            if actual:
+                if actual == SLIRP_EXPECTED_GUEST_IP:
+                    log("guest IP %s matches hostfwd target, ok" % actual)
+                    guard_done = True
+                else:
+                    log("guest IP %s != expected %s; rewriting hostfwd via monitor"
+                        % (actual, SLIRP_EXPECTED_GUEST_IP))
+                    if rewrite_hostfwd_target(sshport, actual, guest_port=23):
+                        log("hostfwd rewritten to %s:23" % actual)
+                        guard_done = True
+                    else:
+                        log("hostfwd rewrite failed; will retry next iteration")
+        time.sleep(10)
+        retry += 1
+        if retry > max_retries:
+            if restarted or not restart_cb:
+                log("telnet is failed."); return False
+            log("telnet failed; trying restart")
+            restarted = True
+            restart_cb()
+            retry = 0
+            guard_done = False
+    log("telnet is ready.")
+    return True
+
+
 def _ssh_ready_check(timeout=None):
     """Probe `ssh $VM_OS_NAME exit` with `-v` so the caller can inspect why
     the connection failed (auth refused, no route, perm denied, banner
@@ -3028,6 +3269,20 @@ def start_and_wait():
 def shutdown_and_wait():
     osname = _check_osname("shutdown_and_wait")
     if not osname: return
+    if env("VM_TRANSPORT") == "telnet":
+        # Deliver the shutdown command over telnet; the guest (plan9 fshalt)
+        # halts the CPU without powering QEMU off, so the real wait below
+        # relies on _wait_vm_down's halt-banner detection + force-kill.
+        ok, _text = telnet_exec([env("VM_SHUTDOWN_CMD")], settle=10.0)
+        log("telnet shutdown command sent (connected=%s)" % ok)
+        time.sleep(10)
+        if isRunning() == 0:
+            if shutdownVM() != 0:
+                log("shutdown error")
+        smax = int(env("VM_SHUTDOWN_MAX_SECONDS") or 1800)
+        _wait_vm_down(what="VM shutdown", poll=5, max_seconds=smax)
+        closeConsole()
+        return
     cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=2",
            osname, env("VM_SHUTDOWN_CMD")]
     # The remote shutdown command kills the very connection it runs over, so
@@ -3069,14 +3324,14 @@ def restart_and_wait():
 def _prep_vhd_disk(link):
     """Materialize $osname.qcow2 from a published cloud image URL."""
     osname = env("VM_OS_NAME")
-    qcow = "%s.qcow2" % osname
+    qcow = wf("%s.qcow2" % osname)
     if os.path.exists(qcow): return
     # download() aborts the build itself on an unrecoverable download; every
     # decompress / image-convert below uses must_run/must_sh so a failure there
     # also aborts (FATAL + exit 1) rather than silently leaving a corrupt qcow2
     # that only blows up much later at boot.
     if link.endswith("img.gz"):
-        img = "%s.img" % osname
+        img = wf("%s.img" % osname)
         if not os.path.exists(img):
             try: os.remove(img + ".gz")
             except OSError: pass
@@ -3086,7 +3341,7 @@ def _prep_vhd_disk(link):
         must_run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
                   "-o", "preallocation=off", img, qcow], "qemu-img convert")
     elif link.endswith("img.zst"):
-        img = "%s.img" % osname
+        img = wf("%s.img" % osname)
         if not os.path.exists(img):
             try: os.remove(img + ".zst")
             except OSError: pass
@@ -3094,16 +3349,59 @@ def _prep_vhd_disk(link):
             must_run(["zstd", "-f", "-d", img + ".zst", "-o", img], "zstd decompress")
         must_run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
                   "-o", "preallocation=off", img, qcow], "qemu-img convert")
+    elif link.endswith("img.tar.gz") or link.endswith("img.tar.xz"):
+        # Tarball holding a single raw *.img member whose name varies per
+        # snapshot (e.g. Debian GNU/Hurd publishes
+        # debian-hurd-amd64-20250807.img.tar.gz). Extract the member straight
+        # to stdout (-O) so we never depend on the member's name and never
+        # need a scratch directory; qemu-img convert re-sparsifies the zeros
+        # the -O stream expands. The extracted .img is KEPT (same retry-cache
+        # semantics as the img.gz branch): clearVM() deletes the qcow2 on
+        # every run, so removing the .img would force a full re-download +
+        # re-extract on each rebuild attempt.
+        img = wf("%s.img" % osname)
+        if not os.path.exists(img):
+            tarball = wf("%s.imgtar" % osname)
+            comp = "z" if link.endswith(".gz") else "J"
+            tarcmd = ("tar -x%sf %s --wildcards -O '*.img' > %s"
+                      % (comp, shlex.quote(tarball), shlex.quote(img)))
+            # Reuse an existing tarball (a prior run's download survives a
+            # clearVM). If it is absent or turns out corrupt, (re)download
+            # once and extract again -- that second failure is fatal.
+            if not os.path.exists(tarball) or sh(tarcmd) != 0:
+                try: os.remove(tarball)
+                except OSError: pass
+                download(link, tarball)
+                must_sh(tarcmd, "tar extract %s (corrupt download?)" % tarball)
+        must_run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
+                  "-o", "preallocation=off", img, qcow], "qemu-img convert")
     elif link.endswith(".img"):
-        tmp = "%s.download.img" % osname
+        tmp = wf("%s.download.img" % osname)
         if not os.path.exists(tmp):
             download(link, tmp)
         must_run(["qemu-img", "convert", "-O", "qcow2", "-o", "preallocation=off",
                   tmp, qcow], "qemu-img convert")
         try: os.remove(tmp)
         except OSError: pass
+    elif link.endswith(".qcow2.gz"):
+        # gzip-compressed qcow2 (9front publishes its prebuilt images this
+        # way). gunzip to a temp qcow2, then the usual convert re-sparsifies.
+        tmp = wf("%s.download.qcow2" % osname)
+        if not os.path.exists(tmp):
+            gz = tmp + ".gz"
+            try: os.remove(gz)
+            except OSError: pass
+            download(link, gz)
+            must_sh("gunzip -c %s > %s" % (shlex.quote(gz), shlex.quote(tmp)),
+                    "gunzip %s (corrupt download?)" % gz)
+            try: os.remove(gz)
+            except OSError: pass
+        must_run(["qemu-img", "convert", "-O", "qcow2", "-o", "preallocation=off",
+                  tmp, qcow], "qemu-img convert")
+        try: os.remove(tmp)
+        except OSError: pass
     elif link.endswith(".qcow2"):
-        tmp = "%s.download.qcow2" % osname
+        tmp = wf("%s.download.qcow2" % osname)
         if not os.path.exists(tmp):
             download(link, tmp)
         must_run(["qemu-img", "convert", "-O", "qcow2", "-o", "preallocation=off",
@@ -3133,10 +3431,10 @@ def _gen_enablessh_local():
     pub_path = idrsa + ".pub"
     pub = open(pub_path).read().rstrip("\n")
 
-    try: os.remove("enablessh.local")
+    try: os.remove(wf("enablessh.local"))
     except OSError: pass
-    shutil.copy("enablessh.txt", "enablessh.local")
-    with open("enablessh.local", "a") as f:
+    shutil.copy("enablessh.txt", wf("enablessh.local"))
+    with open(wf("enablessh.local"), "a") as f:
         f.write("echo '%s' >>~/.ssh/authorized_keys\n\n\n\n" % pub)
         b64 = base64.b64encode(pub.encode("utf-8")).decode("ascii")
         f.write("echo '%s' | openssl base64 -d >>~/.ssh/authorized_keys\n\n\n"
@@ -3161,7 +3459,7 @@ def _gen_enablessh_local():
         f.write("grep -q '^StrictModes no' /etc/ssh/sshd_config || "
                 "echo 'StrictModes no' >> /etc/ssh/sshd_config\n")
         f.write("chmod u-w /etc/ssh/sshd_config 2>/dev/null || true\n\n\n")
-    log(open("enablessh.local").read())
+    log(open(wf("enablessh.local")).read())
 
 
 def _enable_ssh_root_branch(sshport):
@@ -3170,7 +3468,7 @@ def _enable_ssh_root_branch(sshport):
     (the guest's 192.168.122.x is not host-reachable)."""
     vmip = getVMIP()
     log("guest slirp ip: %s (connecting via hostfwd 127.0.0.1:%s)" % (vmip, sshport))
-    with open("enablessh.local", "rb") as inp:
+    with open(wf("enablessh.local"), "rb") as inp:
         subprocess.run(
             ["sshpass", "-p", env("VM_ROOT_PASSWORD"), "ssh", "-p", str(sshport),
              "-o", "StrictHostKeyChecking=no",
@@ -3208,11 +3506,11 @@ def _enable_ssh_console_branch():
     if run_hook("enableNetwork"):
         screenText(); time.sleep(60)
     if env("VM_USE_NC_ENABLE_SSH"):
-        inputFileNC("enablessh.local")
+        inputFileNC(wf("enablessh.local"))
     elif env("VM_USE_BASH_ENABLE_SSH"):
-        inputFileBash("enablessh.local")
+        inputFileBash(wf("enablessh.local"))
     else:
-        inputFile("enablessh.local")
+        inputFile(wf("enablessh.local"))
     time.sleep(60); screenText(); time.sleep(10)
     inputKeys("enter"); time.sleep(2)
     inputKeys("enter"); time.sleep(2)
@@ -3253,6 +3551,11 @@ def main(argv):
     if not conf_load(conf_path):
         return 1
 
+    # Everything the build generates lives under WORKDIR (keeps the repo root
+    # clean; see wf()). Create it before any hook / setup / QEMU launch writes
+    # into it.
+    os.makedirs(WORKDIR, exist_ok=True)
+
     # Expose pipeline globals to hooks (so hook code can use bare `osname`
     # etc., mirroring how build.sh's source-d hooks saw shell variables).
     g = globals()
@@ -3262,6 +3565,14 @@ def main(argv):
     osname = g["osname"]
     sshport = g["sshport"]
     opts = g["opts"]
+
+    # Tell hooks where the generated files live. build.py routes the working
+    # qcow2 (and everything else) under WORKDIR via wf(); host_* hooks that
+    # operate on that image -- prepareImage / finalizeImage doing qemu-nbd /
+    # virt-customize -- must target the SAME path, so export it. Hooks read
+    # `$VM_WORK_QCOW` (fall back to `${VM_OS_NAME}.qcow2` for standalone runs).
+    os.environ["VM_WORKDIR"] = WORKDIR
+    os.environ["VM_WORK_QCOW"] = wf("%s.qcow2" % osname)
 
     # Earliest hook point: runs before setup() (which, among other things,
     # extracts VM_QEMU_TAR), so a builder can generate build inputs on the
@@ -3316,16 +3627,28 @@ def main(argv):
     if start_and_wait() != 0:
         log("first boot never reached the login prompt; aborting")
         return 1
-    _gen_enablessh_local()
+    telnet_transport = (env("VM_TRANSPORT") == "telnet")
+    if telnet_transport:
+        # No sshd in the guest; the enablessh hook sets up the guest's own
+        # remote-exec channel (plan9: telnetd + exportfs listeners) instead.
+        # Still make sure the host keypair exists -- the exported sidecar
+        # contract (<output>-id_rsa.pub / <output>-host.id_rsa) is kept
+        # identical so anyvm.py's asset handling stays uniform.
+        idrsa = os.path.join(HOME, ".ssh", "id_rsa")
+        if not os.path.exists(idrsa):
+            run(["ssh-keygen", "-f", idrsa, "-q", "-N", ""])
+    else:
+        _gen_enablessh_local()
 
     if not run_hook("enablessh"):
+        if telnet_transport:
+            log("VM_TRANSPORT=telnet but no enablessh hook set up the guest "
+                "listeners; aborting")
+            return 1
         if env("VM_USE_SSHROOT_BUILD_SSH"):
             _enable_ssh_root_branch(sshport)
         else:
             _enable_ssh_console_branch()
-
-    addSSHHost()
-    log("Sleep for the sshd to restart"); time.sleep(10)
 
     def _restart():
         if isRunning() == 0 and shutdownVM() != 0:
@@ -3333,18 +3656,25 @@ def main(argv):
         _wait_vm_down(what="VM restart", poll=5)
         closeConsole(); start_and_wait()
 
-    if not _wait_ssh(restart_cb=_restart):
-        return 1
+    if telnet_transport:
+        if not _wait_telnet(restart_cb=_restart):
+            return 1
+    else:
+        addSSHHost()
+        log("Sleep for the sshd to restart"); time.sleep(10)
 
-    user = os.environ.get("USER", "user")
-    ssh_init = (
-        'echo "StrictHostKeyChecking=no" >.ssh/config\n'
-        'echo "Host host" >>.ssh/config\n'
-        'echo "     HostName  192.168.122.1" >>.ssh/config\n'
-        'echo "     User %s" >>.ssh/config\n'
-        'echo "     ServerAliveInterval 1" >>.ssh/config\n'
-    ) % user
-    subprocess.run(["ssh", osname, "sh"], input=ssh_init.encode())
+        if not _wait_ssh(restart_cb=_restart):
+            return 1
+
+        user = os.environ.get("USER", "user")
+        ssh_init = (
+            'echo "StrictHostKeyChecking=no" >.ssh/config\n'
+            'echo "Host host" >>.ssh/config\n'
+            'echo "     HostName  192.168.122.1" >>.ssh/config\n'
+            'echo "     User %s" >>.ssh/config\n'
+            'echo "     ServerAliveInterval 1" >>.ssh/config\n'
+        ) % user
+        subprocess.run(["ssh", osname, "sh"], input=ssh_init.encode())
 
     if run_hook("postBuild"):
         if restart_and_wait() != 0:
@@ -3356,8 +3686,22 @@ def main(argv):
     output = "%s-%s" % (osname, env("VM_RELEASE"))
     if env("VM_ARCH"):
         output = "%s-%s" % (output, env("VM_ARCH"))
-    with open("%s-id_rsa.pub" % output, "w") as f:
-        subprocess.run(["ssh", osname, "cat ~/.ssh/id_rsa.pub"], stdout=f)
+    # Route every release-artifact file (<output>.qcow2.zst + -id_rsa.pub /
+    # -host.id_rsa / .qemu / .profile.json sidecars) into WORKDIR by making the
+    # shared basename a WORKDIR-relative path prefix. The CI upload step
+    # (build.tpl.yml) reads them from build/ to match.
+    output = wf(output)
+    if telnet_transport:
+        # No ssh in the guest to cat a key out of; publish the host's pubkey
+        # so the sidecar asset set stays complete (unused at runtime).
+        pub_src = os.path.join(HOME, ".ssh", "id_rsa.pub")
+        with open("%s-id_rsa.pub" % output, "w") as f:
+            if os.path.exists(pub_src):
+                with open(pub_src) as src:
+                    f.write(src.read())
+    else:
+        with open("%s-id_rsa.pub" % output, "w") as f:
+            subprocess.run(["ssh", osname, "cat ~/.ssh/id_rsa.pub"], stdout=f)
 
     if env("VM_PRE_INSTALL_PKGS"):
         inst_script = env("VM_INSTALL_SCRIPT")
@@ -3468,7 +3812,9 @@ def main(argv):
     # base64 re-append emits none; the explicit `echo >>` is meant to terminate
     # it -- assert that held). If the VM is not ssh-reachable at this point
     # (some console-only images), warn and continue rather than fail.
-    if _ssh_ready_check()[0]:
+    if telnet_transport:
+        log("authorized_keys check: telnet transport, guest has no ssh; skipping")
+    elif _ssh_ready_check()[0]:
         # Pull the whole authorized_keys back and judge it in Python rather
         # than with a remote shell test. `cat` runs under any login shell; a
         # POSIX `[ -z "$(...)" ]` does not -- FreeBSD roots default to tcsh,
@@ -3500,7 +3846,7 @@ def main(argv):
 
     if env("VM_ISO_LINK"):
         log("Clean up ISO for more space")
-        try: os.remove("%s.iso" % osname)
+        try: os.remove(wf("%s.iso" % osname))
         except OSError: pass
 
     log("contents of home directory:"); sh("ls -lah")
