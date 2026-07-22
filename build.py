@@ -465,7 +465,7 @@ def host_nested_amd_with_avx512():
 
 def qemu_accel():
     a = env("VM_ARCH") or "x86_64"
-    if a in ("riscv64", "s390x"):
+    if a in ("riscv64", "s390x", "loongarch64"):
         return "tcg"
     if a == "aarch64":
         if HOST_ARCH in ("aarch64", "arm64"):
@@ -503,6 +503,7 @@ def net_card():
       * openbsd >=7.7     -> virtio-net-pci
       * dragonflybsd != 6.4.0 -> virtio-net-pci
       * riscv64           -> virtio-net-pci  (RISC-V virt has no e1000 PCI BAR)
+      * loongarch64       -> virtio-net-pci  (loongarch virt is a virtio machine)
       * netbsd aarch64    -> virtio-net-pci  (evbarm GENERIC has vioif, not wm)
       * freebsd           -> virtio-net-pci  (cloud images: vtnet0 baked in)
       * ubuntu            -> virtio-net-pci  (cloud-init/netplan pinned to virtio)
@@ -528,7 +529,7 @@ def net_card():
     elif osname == "dragonflybsd":
         if release != "6.4.0":
             nic = "virtio-net-pci"
-    elif arch == "riscv64":
+    elif arch in ("riscv64", "loongarch64"):
         nic = "virtio-net-pci"
     elif osname == "netbsd" and arch == "aarch64":
         nic = "virtio-net-pci"
@@ -688,6 +689,27 @@ def _find_aarch64_efi_code(qemu_bin=None):
             p = os.path.join(d, rn)
             if os.path.exists(p):
                 return p
+    return ""
+
+
+def _find_loongarch64_efi_code(qemu_bin=None):
+    """Locate the EDK2 LoongArch CODE firmware. Returns full path or ''.
+
+    QEMU bundles the pair edk2-loongarch64-code.fd / edk2-loongarch64-vars.fd
+    in its datadir since 9.2 (docs/system/loongarch/virt.rst boots the virt
+    machine with this UEFI firmware); noble's stock 8.2 does NOT ship it, so
+    confs pin a newer QEMU via VM_QEMU_TAR and the search below finds the
+    firmware relative to that extracted binary first. $VM_EFI_CODE overrides
+    the search entirely (same knob as aarch64)."""
+    override = env("VM_EFI_CODE")
+    if override:
+        if os.path.exists(override):
+            return override
+        log("VM_EFI_CODE=%s not found; falling back to autodetect" % override)
+    for d in _aarch64_efi_search_dirs(qemu_bin):
+        p = os.path.join(d, "qemu", "edk2-loongarch64-code.fd")
+        if os.path.exists(p):
+            return p
     return ""
 
 
@@ -950,6 +972,40 @@ def build_qemu_args(media_kind=None, media_path=None):
                   "-device", "virtio-blk-device,drive=disk0"]
         else:
             a += ["-drive", "file=%s,format=qcow2,if=virtio,discard=unmap,detect-zeroes=unmap" % qcow]
+
+    elif arch == "loongarch64":
+        # QEMU loongarch virt machine (docs/system/loongarch/virt.rst):
+        # -cpu la464 + the bundled EDK2 UEFI firmware loaded via -bios (the
+        # boot path the QEMU docs document for this machine). NVRAM vars are
+        # not persisted with -bios, so the guest image must boot via the EFI
+        # removable/fallback path -- the openEuler loongarch64 qcow2 does.
+        # The firmware is bundled only in QEMU >= 9.2 (noble's stock 8.2
+        # lacks it), hence the VM_QEMU_TAR pin in the conf; the search below
+        # looks next to the resolved QEMU binary first so the pinned
+        # tarball's share/qemu tree wins. Console-only build: the conf sets
+        # VM_USE_CONSOLE_BUILD=1 (serial UART) and no VGA device is added.
+        lcpu = env("VM_CPU_MODEL") or "la464"
+        a += ["-machine", "virt,accel=%s" % accel, "-cpu", lcpu]
+        if not env("VM_BIOS"):
+            la_fw = _find_loongarch64_efi_code(resolve_qemu_bin())
+            if la_fw:
+                a += ["-bios", la_fw]
+            else:
+                log("loongarch64 EDK2 firmware (edk2-loongarch64-code.fd) "
+                    "not found; relying on QEMU's default firmware search")
+        a += ["-device", "%s,netdev=net0" % nic]
+        a += ["-drive", "file=%s,format=qcow2,if=none,id=disk0,discard=unmap,detect-zeroes=unmap" % qcow]
+        if media_kind == "disk":
+            a += ["-drive", "file=%s,format=raw,if=none,id=inst0" % media_path]
+            a += ["-device", "virtio-blk-pci,drive=inst0,bootindex=0"]
+            a += ["-device", "virtio-blk-pci,drive=disk0,bootindex=1"]
+        elif media_kind == "cdrom":
+            a += ["-drive", "file=%s,format=raw,if=none,id=inst0,media=cdrom" % media_path]
+            a += ["-device", "virtio-scsi-pci,id=scsi0"]
+            a += ["-device", "scsi-cd,bus=scsi0.0,drive=inst0,bootindex=0"]
+            a += ["-device", "virtio-blk-pci,drive=disk0,bootindex=1"]
+        else:
+            a += ["-device", "virtio-blk-pci,drive=disk0,bootindex=0"]
 
     elif arch == "s390x":
         # QEMU s390-ccw-virtio (IBM Z). The bundled s390-ccw.img firmware
@@ -1255,6 +1311,8 @@ def _profile_machine():
         return "virt", opts
     if arch == "riscv64":
         return "virt", "usb=on,acpi=off"
+    if arch == "loongarch64":
+        return "virt", ""
     if arch == "s390x":
         return "s390-ccw-virtio", ""
     if arch == "sparc64":
@@ -1285,6 +1343,9 @@ def _profile_cpu_model():
         return "neoverse-n1" if osname == "openbsd" else "max"
     if arch == "riscv64":
         return "rv64"
+    if arch == "loongarch64":
+        # QEMU docs/system/loongarch/virt.rst: the virt machine's CPU type.
+        return "la464"
     if arch == "s390x":
         return "qemu"
     if arch in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
@@ -1319,6 +1380,9 @@ def _profile_firmware_kind():
         return "edk2-pflash"
     if arch == "riscv64":
         return "uboot"
+    if arch == "loongarch64":
+        # EDK2 CODE image loaded via -bios (no pflash vars store).
+        return "edk2-bios"
     return "default"
 
 
@@ -1371,8 +1435,8 @@ def build_guest_profile():
     # Effective VGA device, normalized the way build_qemu_args() emits it.
     if arch == "sparc64":
         vga = "none"
-    elif arch in ("riscv64", "s390x", "powerpc64", "powerpc64le",
-                  "ppc64", "ppc64le"):
+    elif arch in ("riscv64", "loongarch64", "s390x", "powerpc64",
+                  "powerpc64le", "ppc64", "ppc64le"):
         vga = None             # console-only arches add no video device
     elif arch == "aarch64":
         v = vga_type()
@@ -1870,6 +1934,14 @@ def setup(install_ocr=None):
         if env("VM_ARCH") == "riscv64":
             _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "qemu-system-misc", "u-boot-qemu"], env=apt_env)
+        if env("VM_ARCH") == "loongarch64":
+            # qemu-system-loongarch64 ships in qemu-system-misc on Ubuntu.
+            # Installing it also pulls the runtime libs the pinned
+            # VM_QEMU_TAR binary needs (glib, pixman, slirp, fdt); the
+            # stock 8.2 binary itself lacks the bundled EDK2 LoongArch
+            # firmware, which is why confs pin QEMU >= 9.2 via VM_QEMU_TAR.
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
+                        "qemu-system-misc"], env=apt_env)
         if env("VM_ARCH") == "aarch64":
             _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "qemu-system-arm", "qemu-efi-aarch64"], env=apt_env)
@@ -2918,7 +2990,15 @@ def run_hook(name):
         log(host_sh)
         with open(host_sh) as f:
             log(f.read())
-        subprocess.run(["bash", host_sh], env=os.environ.copy())
+        rc = subprocess.run(["bash", host_sh], env=os.environ.copy()).returncode
+        if rc != 0:
+            # A failed host hook is fatal: continuing past it ships a broken
+            # image or wastes an hour before failing anyway (a prepareImage
+            # hook whose virt-customize died leaves a cloud image with no
+            # ssh access at all -- the build then waits on sshd forever).
+            # Hooks that intend a step to be tolerated must '|| true' it.
+            log("FATAL: hook %s exited %d" % (host_sh, rc))
+            sys.exit(1)
         return True
     vm_sh = "hooks/vm_%s.sh" % name
     if os.path.exists(vm_sh):
