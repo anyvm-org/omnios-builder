@@ -1080,6 +1080,22 @@ def build_qemu_args(media_kind=None, media_path=None):
         a += ["-device", "%s,netdev=net0,bus=pciB" % sparc_nic]
         # Main disk on IDE primary master -> wd0. qcow2 rides the cmd646 fine.
         a += ["-drive", "file=%s,format=qcow2,if=ide,index=0" % qcow]
+        # Optional second disk on a PCI SCSI HBA, placed AFTER the NIC so the
+        # controller lands on pciB dev 1 (the locally verified topology).
+        # Used by NetBSD 10.x sparc64's cmd646-wedge bypass: the migration
+        # hook (netbsd-builder hooks/host_postBuild.py) creates the file
+        # mid-pipeline and moves the root filesystem onto it (guest sd0);
+        # attachment is gated on the file existing, so the install phase and
+        # any build without the hook are unaffected. mptsas1068 is the ONLY
+        # SCSI model both QEMU emulates and NetBSD/sparc64 GENERIC drives
+        # correctly (lsi53c895a: esiop interrupt loop; am53c974: broken READ
+        # CAPACITY; nvme/ahci: no sparc64 driver; virtio: unusable on sun4u).
+        xdisk = env("VM_EXTRA_DISK")
+        if xdisk and os.path.exists(wf(xdisk)):
+            xdev = env("VM_EXTRA_DISK_DEVICE") or "mptsas1068"
+            a += ["-device", "%s,id=anyscsi0,bus=pciB" % xdev]
+            a += ["-drive", "file=%s,format=qcow2,if=none,id=xdisk0" % wf(xdisk)]
+            a += ["-device", "scsi-hd,drive=xdisk0,bus=anyscsi0.0"]
         if media_kind == "cdrom":
             # Install DVD on IDE secondary master -> cd0; boot from it.
             a += ["-drive", "file=%s,format=raw,if=ide,index=2,media=cdrom" % media_path]
@@ -1484,6 +1500,15 @@ def build_guest_profile():
         "transport": "telnet" if env("VM_TRANSPORT") == "telnet" else "ssh",
         "mem_cap_mb": mem_cap,
         "cpu_cap": cpu_cap,
+        # Hybrid two-disk layout (NetBSD 10.x sparc64): when boot_disk is
+        # true, the MAIN qcow2 asset is the root disk and attaches as a
+        # scsi-hd behind `scsi_controller` (on pciB), while a separate
+        # <image>-boot.qcow2.zst asset (bootblock + ofwboot + kernel) goes on
+        # disk_if (IDE index 0) purely to be booted from. Both None/false on
+        # every classic single-disk image.
+        "scsi_controller": ((env("VM_EXTRA_DISK_DEVICE") or "mptsas1068")
+                            if env("VM_EXTRA_DISK") else None),
+        "boot_disk": bool(env("VM_EXTRA_DISK")),
     }
 
 
@@ -2611,41 +2636,60 @@ def addNAT(proto=None, hostPort=None, vmPort=None):
     return 0
 
 
+def _export_disk(src, out):
+    """Convert + compress ONE work disk into a release asset.
+
+    Stage 1: qemu-img convert the work disk into a fresh, compacted /
+    sparsified qcow2 at the release path. qemu-img refuses to use the same
+    file as both input and output, so we write to `out` and swap below.
+    Peak disk during this step: src + out (~2x the qcow2 size, briefly).
+
+    Stage 2: drop the original work disk and move the converted one into
+    its place. After this we hold a single qcow2 file (~1x), and the
+    downstream verification VM (started later in main()) still boots from
+    the same work path it always did. Without this swap, zstd below runs
+    with src + out + the growing .zst chunks all on disk simultaneously
+    (~2.25x peak), which trips the runner's free-space margin for the
+    bigger images.
+
+    Stage 3: stream-compress the single remaining qcow2 to the release
+    `<out>.zst[.N]`. split keeps any future >2GB build's chunks under
+    GitHub's release-asset size cap; single-chunk case renames .zst.0 ->
+    .zst so consumers just `zstd -d` the one file. bash + pipefail so a
+    zstd failure mid-pipe aborts (a bare pipe would report only split's
+    exit and silently ship a truncated .zst)."""
+    log(src)
+    must_run(["qemu-img", "convert", "-O", "qcow2", "-S", "4k",
+              "-o", "preallocation=off", src, out], "qemu-img convert (export)")
+    try: os.remove(src)
+    except OSError: pass
+    os.rename(out, src)
+    must_run(["bash", "-c", "set -o pipefail; zstd -c %s | split -b 2000M -d -a 1 - %s"
+              % (shlex.quote(src), shlex.quote(out + ".zst."))], "zstd compress")
+    run(["ls", "-lah"])
+    try: os.rename(out + ".zst.0", out + ".zst")
+    except OSError: pass
+    sh("chmod +r %s* 2>/dev/null || true" % shlex.quote(out + ".zst"))
+
+
 def exportOVA(ova=None, qemu_args=None):
     osname = _check_osname("exportOVA")
     if not osname: return 1
     if not ova:
         log("Usage: exportOVA out.qcow2 [out.qemu]"); return 1
     src = wf("%s.qcow2" % osname)
-    log(src)
-    # Stage 1: qemu-img convert the work disk into a fresh, compacted /
-    # sparsified qcow2 at the release path. qemu-img refuses to use the same
-    # file as both input and output, so we write to `ova` and swap below.
-    # Peak disk during this step: src + ova (~2x the qcow2 size, briefly).
-    must_run(["qemu-img", "convert", "-O", "qcow2", "-S", "4k",
-              "-o", "preallocation=off", src, ova], "qemu-img convert (export)")
-    # Stage 2: drop the original work disk and move the converted one into
-    # its place. After this we hold a single qcow2 file (~1x), and the
-    # downstream verification VM (started later in main()) still boots from
-    # the same `<osname>.qcow2` path it always did. Without this swap, zstd
-    # below runs with src + ova + the growing .zst chunks all on disk
-    # simultaneously (~2.25x peak), which trips the runner's free-space
-    # margin for the bigger images.
-    try: os.remove(src)
-    except OSError: pass
-    os.rename(ova, src)
-    # Stage 3: stream-compress the single remaining qcow2 to the release
-    # `<output>.qcow2.zst[.N]`. split keeps any future >2GB build's chunks
-    # under GitHub's release-asset size cap; single-chunk case renames
-    # .zst.0 -> .zst so consumers just `zstd -d` the one file.
-    # bash + pipefail so a zstd failure mid-pipe aborts (a bare pipe would
-    # report only split's exit and silently ship a truncated .zst).
-    must_run(["bash", "-c", "set -o pipefail; zstd -c %s | split -b 2000M -d -a 1 - %s"
-              % (shlex.quote(src), shlex.quote(ova + ".zst."))], "zstd compress")
-    run(["ls", "-lah"])
-    try: os.rename(ova + ".zst.0", ova + ".zst")
-    except OSError: pass
-    sh("chmod +r %s* 2>/dev/null || true" % shlex.quote(ova + ".zst"))
+    xdisk = env("VM_EXTRA_DISK")
+    if xdisk and os.path.exists(wf(xdisk)):
+        # Hybrid two-disk layout (NetBSD 10.x sparc64 cmd646-wedge bypass):
+        # the MAIN asset <output>.qcow2.zst is the ROOT disk (VM_EXTRA_DISK,
+        # guest sd0 on the SCSI HBA) and the small IDE boot disk (bootblock +
+        # ofwboot + kernel only, never mounted at runtime) ships beside it as
+        # <output>-boot.qcow2.zst. anyvm.py learns the layout from the
+        # profile's boot_disk / scsi_controller keys.
+        _export_disk(wf(xdisk), ova)
+        _export_disk(src, re.sub(r"\.qcow2$", "-boot.qcow2", ova))
+    else:
+        _export_disk(src, ova)
     if qemu_args:
         cl = state(osname, "cmdline")
         if os.path.exists(cl):
@@ -2948,8 +2992,18 @@ def processOpts(optsfile=None):
 # ============================================================================
 
 def run_hook(name):
-    """Run a hook. Returns True if any hook ran. Where the hook runs is encoded
-    in the filename prefix:
+    """Run the hooks for a hook point. Returns True if any hook ran.
+
+    BOTH SIDES run when both are present -- guest first, then host:
+
+      hooks/vm_<name>.sh    -- guest-side, piped into the guest's sh via SSH
+                               with SendEnv=VM_RELEASE. Use for in-guest
+                               configuration (service xxx enable, sysrc,
+                               editing /etc/*, installing packages, ...).
+                               Guest hooks are always .sh because the guest
+                               is not guaranteed to have Python. Runs FIRST
+                               so a host hook can build on the configured
+                               guest (e.g. reboot it / rearrange disks).
 
       hooks/host_<name>.py  -- host-side, exec()'d into THIS module's globals.
                                The hook can call build.py functions directly
@@ -2957,25 +3011,35 @@ def run_hook(name):
                                screenText, ...) and see pipeline globals
                                (osname, sshport, opts) as bare names.
                                Use whenever the hook needs the VM-abstraction
-                               API. Lookup precedence #1.
+                               API.
 
       hooks/host_<name>.sh  -- host-side, plain `bash` subprocess. The conf's
                                VM_* env vars are inherited. Use for straight
                                bash tooling on the host that does NOT need
                                build.py functions (virt-customize, qemu-img,
-                               shell glue, ...). Lookup precedence #2.
-
-      hooks/vm_<name>.sh    -- guest-side, piped into the guest's sh via SSH
-                               with SendEnv=VM_RELEASE. Use for in-guest
-                               configuration (service xxx enable, sysrc,
-                               editing /etc/*, installing packages, ...).
-                               Guest hooks are always .sh because the guest
-                               is not guaranteed to have Python. Lookup
-                               precedence #3.
+                               shell glue, ...). Only runs when no host .py
+                               exists -- the two host forms are alternative
+                               implementations of the same host side.
 
     Callers pass the logical hook name (e.g. "installOpts", "postBuild");
-    the prefix lookup is internal."""
+    the prefix lookup is internal. (Until 2026-07 this was a first-match-
+    wins lookup with host taking precedence, so a host hook silently
+    shadowed a same-name guest hook and had to re-pipe it by hand; only
+    netbsd's postBuild pair was affected by the semantic change.)"""
+    ran = False
+    vm_sh = "hooks/vm_%s.sh" % name
+    if os.path.exists(vm_sh):
+        log(vm_sh)
+        with open(vm_sh) as f:
+            log(f.read())
+        with open(vm_sh, "rb") as f:
+            subprocess.run(
+                ["ssh", "-o", "SendEnv=VM_RELEASE",
+                 globals().get("osname") or env("VM_OS_NAME"), "sh"],
+                stdin=f)
+        ran = True
     py = "hooks/host_%s.py" % name
+    host_sh = "hooks/host_%s.sh" % name
     if os.path.exists(py):
         log(py)
         with open(py) as f:
@@ -2984,9 +3048,8 @@ def run_hook(name):
         g = globals()
         g.setdefault("__hookname__", name)
         exec(compile(code, py, "exec"), g)
-        return True
-    host_sh = "hooks/host_%s.sh" % name
-    if os.path.exists(host_sh):
+        ran = True
+    elif os.path.exists(host_sh):
         log(host_sh)
         with open(host_sh) as f:
             log(f.read())
@@ -2999,19 +3062,8 @@ def run_hook(name):
             # Hooks that intend a step to be tolerated must '|| true' it.
             log("FATAL: hook %s exited %d" % (host_sh, rc))
             sys.exit(1)
-        return True
-    vm_sh = "hooks/vm_%s.sh" % name
-    if os.path.exists(vm_sh):
-        log(vm_sh)
-        with open(vm_sh) as f:
-            log(f.read())
-        with open(vm_sh, "rb") as f:
-            subprocess.run(
-                ["ssh", "-o", "SendEnv=VM_RELEASE",
-                 globals().get("osname") or env("VM_OS_NAME"), "sh"],
-                stdin=f)
-        return True
-    return False
+        ran = True
+    return ran
 
 
 def inputKeys(keys):
@@ -3251,9 +3303,33 @@ def _ssh_verbose_summary(stderr_text, head=20, tail=10):
     return "\n".join(lines[:head] + ["    ... (%d lines trimmed) ..." % (len(lines) - head - tail)] + lines[-tail:])
 
 
+def _serial_lost_interrupt_count():
+    """Count 'lost interrupt' lines in the current QEMU serial log.
+
+    A steadily GROWING count while the guest is invisible on the network is
+    the cmd646-wedge signature (NetBSD 10.x sparc64: QEMU sun4u's CMD646
+    randomly enters a sustained lost-interrupt state, on 8.2.2 and 10.2.3
+    alike -- verified 2026-07-23). Such a guest shows a login: prompt but its
+    disk and NIC are dead: ssh will never come up and a graceful shutdown
+    never completes, so waiting the full probe budget on it is pure waste.
+    Generic on purpose -- any guest spamming 'lost interrupt' with zero
+    network presence is not going to recover on its own."""
+    osname = env("VM_OS_NAME")
+    if not osname: return 0
+    try:
+        with open(serial_log(osname), "rb") as f:
+            return f.read().count(b"lost interrupt")
+    except OSError:
+        return 0
+
+
 def _wait_ssh(max_retries=100, restart_cb=None):
     """Poll ssh through the hostfwd port until reachable; optional restart_cb
-    runs once on terminal failure.
+    reboots the guest on failure, up to VM_SSH_MAX_RESTARTS times (default 1,
+    the historical behavior -- a genuinely broken guest should fail fast).
+    Confs whose boots die RANDOMLY (netbsd 10.x sparc64: cmd646 wedge, where
+    a fresh boot usually clears it and the wedge cutoff below makes each
+    retry cheap) raise it explicitly.
 
     Every retry we ALSO run the layered IP probe (anyvm.py:6100-6118
     "hostfwd guard"): under slirp the guest's DHCP lease should be
@@ -3274,8 +3350,16 @@ def _wait_ssh(max_retries=100, restart_cb=None):
     except ValueError:
         sshport = 22
     retry = 0
-    restarted = False
+    restarts = 0
+    try:
+        max_restarts = int(env("VM_SSH_MAX_RESTARTS") or 1)
+    except ValueError:
+        max_restarts = 1
     guard_done = False
+    # Baseline, not zero: the install phase may legitimately have printed a
+    # few 'lost interrupt' lines already -- only NEW lines during this wait
+    # indicate the guest wedged underneath us.
+    lost_base = _serial_lost_interrupt_count()
     # Dump ssh -v output every Nth failed retry so we can see WHY ssh
     # failed (auth denied, refused, etc.) without flooding the build log.
     VERBOSE_EVERY = 5
@@ -3307,16 +3391,37 @@ def _wait_ssh(max_retries=100, restart_cb=None):
                         guard_done = True
                     else:
                         log("hostfwd rewrite failed; will retry next iteration")
-        time.sleep(10)
-        retry += 1
-        if retry > max_retries:
-            if restarted or not restart_cb:
+        # Early wedge cutoff: no guest IP anywhere (usernet AND serial both
+        # blank) plus a growing lost-interrupt storm means the guest's disk
+        # and NIC are dead -- probing the remaining budget is pointless, and
+        # a graceful shutdown of such a guest never completes (it burned the
+        # full _wait_vm_down timeout in CI). Force-kill and reroll at once.
+        if (not guard_done and retry >= 6
+                and _serial_lost_interrupt_count() - lost_base >= 3):
+            log("guest looks wedged: lost-interrupt storm on the serial "
+                "console and no guest IP after %d ssh probes" % (retry + 1))
+            if not restart_cb or restarts >= max_restarts:
                 log("ssh is failed."); return False
-            log("ssh failed; trying restart")
-            restarted = True
+            restarts += 1
+            log("force-killing the wedged guest and rebooting "
+                "(restart %d/%d)" % (restarts, max_restarts))
+            destroyVM()
             restart_cb()
             retry = 0
             guard_done = False  # new boot, recheck IP
+            lost_base = _serial_lost_interrupt_count()
+            continue
+        time.sleep(10)
+        retry += 1
+        if retry > max_retries:
+            if restarts >= max_restarts or not restart_cb:
+                log("ssh is failed."); return False
+            restarts += 1
+            log("ssh failed; trying restart (%d/%d)" % (restarts, max_restarts))
+            restart_cb()
+            retry = 0
+            guard_done = False  # new boot, recheck IP
+            lost_base = _serial_lost_interrupt_count()
     return True
 
 
