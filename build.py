@@ -1080,22 +1080,6 @@ def build_qemu_args(media_kind=None, media_path=None):
         a += ["-device", "%s,netdev=net0,bus=pciB" % sparc_nic]
         # Main disk on IDE primary master -> wd0. qcow2 rides the cmd646 fine.
         a += ["-drive", "file=%s,format=qcow2,if=ide,index=0" % qcow]
-        # Optional second disk on a PCI SCSI HBA, placed AFTER the NIC so the
-        # controller lands on pciB dev 1 (the locally verified topology).
-        # Used by NetBSD 10.x sparc64's cmd646-wedge bypass: the migration
-        # hook (netbsd-builder hooks/host_postBuild.py) creates the file
-        # mid-pipeline and moves the root filesystem onto it (guest sd0);
-        # attachment is gated on the file existing, so the install phase and
-        # any build without the hook are unaffected. mptsas1068 is the ONLY
-        # SCSI model both QEMU emulates and NetBSD/sparc64 GENERIC drives
-        # correctly (lsi53c895a: esiop interrupt loop; am53c974: broken READ
-        # CAPACITY; nvme/ahci: no sparc64 driver; virtio: unusable on sun4u).
-        xdisk = env("VM_EXTRA_DISK")
-        if xdisk and os.path.exists(wf(xdisk)):
-            xdev = env("VM_EXTRA_DISK_DEVICE") or "mptsas1068"
-            a += ["-device", "%s,id=anyscsi0,bus=pciB" % xdev]
-            a += ["-drive", "file=%s,format=qcow2,if=none,id=xdisk0" % wf(xdisk)]
-            a += ["-device", "scsi-hd,drive=xdisk0,bus=anyscsi0.0"]
         if media_kind == "cdrom":
             # Install DVD on IDE secondary master -> cd0; boot from it.
             a += ["-drive", "file=%s,format=raw,if=ide,index=2,media=cdrom" % media_path]
@@ -1500,15 +1484,6 @@ def build_guest_profile():
         "transport": "telnet" if env("VM_TRANSPORT") == "telnet" else "ssh",
         "mem_cap_mb": mem_cap,
         "cpu_cap": cpu_cap,
-        # Hybrid two-disk layout (NetBSD 10.x sparc64): when boot_disk is
-        # true, the MAIN qcow2 asset is the root disk and attaches as a
-        # scsi-hd behind `scsi_controller` (on pciB), while a separate
-        # <image>-boot.qcow2.zst asset (bootblock + ofwboot + kernel) goes on
-        # disk_if (IDE index 0) purely to be booted from. Both None/false on
-        # every classic single-disk image.
-        "scsi_controller": ((env("VM_EXTRA_DISK_DEVICE") or "mptsas1068")
-                            if env("VM_EXTRA_DISK") else None),
-        "boot_disk": bool(env("VM_EXTRA_DISK")),
     }
 
 
@@ -2184,6 +2159,7 @@ def _wait_vm_down(what="VM", poll=20, max_seconds=1800):
     elapsed = 0
     stalled = 0
     last_size = -1
+    poweroff_ack = False   # guest printed a shutdown/poweroff ack (see below)
     while isRunning() == 0:
         time.sleep(poll)
         elapsed += poll
@@ -2200,6 +2176,19 @@ def _wait_vm_down(what="VM", poll=20, max_seconds=1800):
             log("%s: guest halted without powering off QEMU; force-killing" % what)
             destroyVM()
             return
+        # Latch a shutdown/poweroff ACK. NetBSD sparc64's `shutdown -p` prints
+        # "poweroff by root:" and then, on sun4u, sometimes HALTS without ever
+        # printing the "has halted" banner above and without QEMU exiting --
+        # the serial just goes silent on that line (seen 2026-07-25: a 10.0
+        # build sat ~5 min in the generic silent cutoff below). Once the ack
+        # is seen, a SHORT spell of serial silence means the guest finished
+        # syncing and halted: a still-syncing guest keeps writing progress
+        # (which resets `stalled`), so 60 s of dead-silence AFTER the ack is a
+        # safe "it's down" signal -- force-kill then instead of waiting the
+        # full 300 s. The ack gate makes this fire only on a genuine shutdown.
+        if re.search(r"poweroff by root|shutdown:.*poweroff|Powering off",
+                     tail, re.I):
+            poweroff_ack = True
         # Console builds only: the serial log IS the guest console there, so
         # a shutdown that stops writing to it has stopped making progress.
         # Empirically (NetBSD 10.1 sparc64): the cmd646 lost-interrupt storm
@@ -2214,6 +2203,11 @@ def _wait_vm_down(what="VM", poll=20, max_seconds=1800):
             stalled = 0
         else:
             stalled += poll
+            if poweroff_ack and stalled >= 60:
+                log("%s: guest acknowledged poweroff and serial silent %d s; "
+                    "force-killing QEMU" % (what, stalled))
+                destroyVM()
+                return
             if env("VM_USE_CONSOLE_BUILD") and stalled >= 300:
                 log("%s: serial console silent for %d s; force-killing QEMU"
                     % (what, stalled))
@@ -2678,18 +2672,7 @@ def exportOVA(ova=None, qemu_args=None):
     if not ova:
         log("Usage: exportOVA out.qcow2 [out.qemu]"); return 1
     src = wf("%s.qcow2" % osname)
-    xdisk = env("VM_EXTRA_DISK")
-    if xdisk and os.path.exists(wf(xdisk)):
-        # Hybrid two-disk layout (NetBSD 10.x sparc64 cmd646-wedge bypass):
-        # the MAIN asset <output>.qcow2.zst is the ROOT disk (VM_EXTRA_DISK,
-        # guest sd0 on the SCSI HBA) and the small IDE boot disk (bootblock +
-        # ofwboot + kernel only, never mounted at runtime) ships beside it as
-        # <output>-boot.qcow2.zst. anyvm.py learns the layout from the
-        # profile's boot_disk / scsi_controller keys.
-        _export_disk(wf(xdisk), ova)
-        _export_disk(src, re.sub(r"\.qcow2$", "-boot.qcow2", ova))
-    else:
-        _export_disk(src, ova)
+    _export_disk(src, ova)
     if qemu_args:
         cl = state(osname, "cmdline")
         if os.path.exists(cl):
