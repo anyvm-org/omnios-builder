@@ -48,7 +48,7 @@ jobs:
 #        # this might remove tools that are actually needed,
 #        # if set to "true" but frees about 6 GB
 #        tool-cache: false
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Creating Web console
       uses: anyvm-org/cf-tunnel@v0
       id: tunnel
@@ -103,6 +103,33 @@ jobs:
           build/omnios-${{ matrix.os }}-host.id_rsa
           build/omnios-${{ matrix.os }}.qemu
           build/omnios-${{ matrix.os }}.profile.json
+
+
+  # Publish the generated release index (gendata's .github/data/releases.json)
+  # as a release asset, so external consumers reference it by an explicit
+  # builder version -- .../releases/download/v<ver>/releases.json -- exactly
+  # like the images and their sidecars. The index and the images it describes
+  # are then a matched, reproducible pair from one release; nothing downstream
+  # has to read a moving branch through raw.githubusercontent.
+  # A single job, NOT part of the build matrix: every matrix job uploading the
+  # same asset name in parallel would race (GitHub rejects duplicate asset
+  # names), and the index must publish even if one image build fails.
+  release-index:
+    # Gate on the event, not github.ref: a 'release' event's github.ref can be
+    # refs/heads/<branch>, which silently skips the upload. event_name is stable.
+    if: "github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')"
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v7
+    - name: Upload release index Asset
+      uses: softprops/action-gh-release@v3
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        # Pass the tag explicitly, same reason as the step above.
+        tag_name: ${{ github.event.release.tag_name || github.ref_name }}
+        files: |
+          .github/data/releases.json
 
 
 
