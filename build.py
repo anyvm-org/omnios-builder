@@ -2187,8 +2187,21 @@ def _wait_vm_down(what="VM", poll=20, max_seconds=600):
         # (which resets `stalled`), so 60 s of dead-silence AFTER the ack is a
         # safe "it's down" signal -- force-kill then instead of waiting the
         # full 300 s. The ack gate makes this fire only on a genuine shutdown.
-        if re.search(r"poweroff by root|shutdown:.*poweroff|Powering off",
-                     tail, re.I):
+        #
+        # ...EXCEPT on sparc64, where the premise is false: QEMU sun4u's cmd646
+        # enters a lost-interrupt state in which each disk command times out
+        # ~10 s and the guest syncs its disks SILENTLY, printing nothing for
+        # minutes on end. There "silent" means "still writing", not "done", and
+        # the shortcut force-killed a 10.1-sparc64 guest 65 s after the ack,
+        # mid-sync: the next boot came up "/dev/rwd0a: UNEXPECTED INCONSISTENCY
+        # ... ABORTING BOOT" with a corrupt root FFS and the build failed
+        # (run 30207643849). That is precisely the premature-force-kill damage
+        # VM_SHUTDOWN_MAX_SECONDS=1200 was added to those confs to avoid, and
+        # the shortcut was bypassing it. On sparc64 only the "has halted"
+        # banner or the full timeout may end the wait.
+        if (env("VM_ARCH") or "") != "sparc64" and re.search(
+                r"poweroff by root|shutdown:.*poweroff|Powering off",
+                tail, re.I):
             poweroff_ack = True
         # Console builds only: the serial log IS the guest console there, so
         # a shutdown that stops writing to it has stopped making progress.
