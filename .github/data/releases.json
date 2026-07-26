@@ -1,0 +1,95 @@
+{
+  "os": "omnios",
+  "releases": [
+    {
+      "tag": "r151046",
+      "release": "r151046",
+      "arch": "x86_64",
+      "sync": "rsync,scp,nfs",
+      "shutdown": "shutdown -y -i5 -g0",
+      "desktop": false,
+      "build": true
+    },
+    {
+      "tag": "r151048",
+      "release": "r151048",
+      "arch": "x86_64",
+      "sync": "rsync,scp,nfs",
+      "shutdown": "shutdown -y -i5 -g0",
+      "desktop": false,
+      "build": true
+    },
+    {
+      "tag": "r151050",
+      "release": "r151050",
+      "arch": "x86_64",
+      "sync": "rsync,scp,nfs",
+      "shutdown": "shutdown -y -i5 -g0",
+      "desktop": false,
+      "build": true
+    },
+    {
+      "tag": "r151052",
+      "release": "r151052",
+      "arch": "x86_64",
+      "sync": "rsync,scp,nfs",
+      "shutdown": "shutdown -y -i5 -g0",
+      "desktop": false,
+      "build": true
+    },
+    {
+      "tag": "r151054",
+      "release": "r151054",
+      "arch": "x86_64",
+      "sync": "rsync,scp,nfs",
+      "shutdown": "shutdown -y -i5 -g0",
+      "desktop": false,
+      "build": true
+    },
+    {
+      "tag": "r151054-build",
+      "release": "r151054-build",
+      "arch": "x86_64",
+      "sync": "rsync,scp,nfs",
+      "shutdown": "shutdown -y -i5 -g0",
+      "desktop": false,
+      "build": true
+    },
+    {
+      "tag": "r151056",
+      "release": "r151056",
+      "arch": "x86_64",
+      "sync": "rsync,scp,nfs",
+      "shutdown": "shutdown -y -i5 -g0",
+      "desktop": false,
+      "build": true
+    },
+    {
+      "tag": "r151056-build",
+      "release": "r151056-build",
+      "arch": "x86_64",
+      "sync": "rsync,scp,nfs",
+      "shutdown": "shutdown -y -i5 -g0",
+      "desktop": false,
+      "build": true
+    },
+    {
+      "tag": "r151058",
+      "release": "r151058",
+      "arch": "x86_64",
+      "sync": "rsync,scp,nfs",
+      "shutdown": "shutdown -y -i5 -g0",
+      "desktop": false,
+      "build": true
+    },
+    {
+      "tag": "r151058-build",
+      "release": "r151058-build",
+      "arch": "x86_64",
+      "sync": "rsync,scp,nfs",
+      "shutdown": "shutdown -y -i5 -g0",
+      "desktop": false,
+      "build": true
+    }
+  ]
+}
