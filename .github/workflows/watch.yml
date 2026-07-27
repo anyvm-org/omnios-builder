@@ -1,0 +1,135 @@
+name: "Watch upstream"
+
+# Track this OS upstream and land the confs for a new release. The
+# generation layer does the rest: landing a conf on main makes
+# generate.yml regenerate all.release.conf / the tables / releases.json
+# and re-render build.yml with the new matrix, and that commit starts the
+# build. See base-builder/watch.py.
+
+permissions:
+  contents: write
+  issues: write
+
+on:
+  schedule:
+    - cron: '40 20 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.VM_TOKEN }}
+
+      - name: Detect and land a new upstream release
+        run: |
+          git switch main || (git fetch --all && git checkout -b main origin/main)
+          git clone https://github.com/anyvm-org/base-builder.git
+          # anyvm holds coverage.allow. Without it watch.py cannot tell
+          # which variants are deliberately untested, and its suggested
+          # allow lines would silently always be empty. Cloned OUTSIDE the
+          # repo so it never shows up in this checkout's working tree.
+          git clone --depth 1 https://github.com/anyvm-org/anyvm.git \
+            "${RUNNER_TEMP}/anyvm"
+          python3 base-builder/watch.py \
+            --allow-file "${RUNNER_TEMP}/anyvm/.github/coverage.allow" \
+            --allow-out "${RUNNER_TEMP}/allow-lines.txt"
+
+      - name: Commit and push changes
+        run: |
+          git config user.email "ghactions@anyvm.org"
+          git config user.name "Watch.yml"
+          git add conf
+          if git diff --cached --quiet; then
+            echo "Nothing to commit, skipping push"
+          else
+            # Carry the suggested coverage.allow lines in the commit
+            # message: watch.py cannot push to the anyvm repo, so this
+            # is where the maintainer (and sub-project B's bump bot)
+            # finds out which lines the new release needs. Built in a
+            # file rather than a shell string -- a multi-line "..." here
+            # would take its indentation from this YAML block scalar.
+            {
+              echo "Add confs for the new upstream release"
+              if [ -s "${RUNNER_TEMP}/allow-lines.txt" ]; then
+                echo
+                echo "Suggested anyvm/.github/coverage.allow lines:"
+                sed 's/^/  /' "${RUNNER_TEMP}/allow-lines.txt"
+              fi
+            } > "${RUNNER_TEMP}/commit-msg.txt"
+            git commit -F "${RUNNER_TEMP}/commit-msg.txt"
+            # Step 1/Step 2 and the version bumper push to main within
+            # seconds of each other, so the ref can move between the
+            # rebase and the push. Rebase and retry instead of failing.
+            pushed=""
+            for attempt in 1 2 3 4 5; do
+              git pull --rebase --autostash
+              if git push; then
+                pushed=yes
+                break
+              fi
+              echo "push rejected (attempt ${attempt}), retrying in ${attempt}s"
+              sleep "${attempt}"
+            done
+            if [ -z "$pushed" ]; then
+              echo "push still rejected after 5 attempts"
+              exit 1
+            fi
+          fi
+
+      # A nightly cron nobody reads is not a watcher. A failure here means
+      # either the detection hook broke (upstream redesigned its page) or
+      # the URL gate rejected the derived confs -- both need a human, and
+      # both leave main untouched, so there is no other visible signal.
+      #
+      # One issue per builder, reused by exact title, and NOT commented on
+      # for every subsequent failure: a watcher that stays broken for a
+      # month would otherwise produce 30 notifications saying the same
+      # thing. Closing the issue after a fix re-arms the report.
+      - name: Report a broken watcher
+        if: failure()
+        env:
+          # github.token, NOT VM_TOKEN: `permissions:` above only scopes
+          # GITHUB_TOKEN, so issues:write buys nothing for a PAT, and
+          # VM_TOKEN is scoped for pushing (contents/workflows) -- gh
+          # would 403 here and the whole report would be dead while
+          # looking configured. readme.yml and rerun.yml already use
+          # github.token for their gh calls.
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "upstream watcher: ${{ github.event.repository.name }}"
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          num=$(gh issue list --state open --limit 100 \
+                  --json number,title \
+                  --jq "[.[] | select(.title == env.TITLE)] | .[0].number // empty")
+          if [ -n "$num" ]; then
+            echo "issue #${num} is already open for this builder"
+            exit 0
+          fi
+          {
+            echo "The upstream watcher failed."
+            echo
+            echo "Run: ${RUN_URL}"
+            echo
+            echo "Most likely nothing was written: either"
+            echo "hooks/upstream_check.py could not detect a version"
+            echo "(upstream page redesign, network or HTTP error), or the"
+            echo "derived confs were rejected before the first write -- a"
+            echo "filename gendata would refuse, a download URL that did"
+            echo "not move off the template, a companion file that cannot"
+            echo "be derived, or a URL that failed its HEAD check."
+            echo "The commit/push step can fail too, in which case the"
+            echo "confs exist on the runner but never reached main."
+            echo "The run log names the exact one."
+            echo
+            echo "This issue is not re-posted while it stays open. Close it"
+            echo "once the watcher is fixed to re-arm the report."
+          } > "${RUNNER_TEMP}/issue-body.txt"
+          gh issue create --title "${TITLE}" \
+            --body-file "${RUNNER_TEMP}/issue-body.txt"
