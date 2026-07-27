@@ -2481,10 +2481,22 @@ def waitForText(text=None, sec="", hook=None):
     appears). `hook` may be a Python callable (preferred) or a shell command
     string (run via `bash -c ...`, kept for porting old hooks).
 
-    Both code paths -- match and timeout -- return 0, so the caller's
-    processOpts unconditionally fires the keystrokes regardless of outcome
-    (intentional: if a screen we expected never showed up, pressing the keys
-    anyway often advances the installer to the next screen we DO recognise).
+    Returns 0 when the text was found, 1 when `sec` elapsed without a match.
+
+    That distinction matters: until 2026-07-27 BOTH paths returned 0 and
+    processOpts fired the keystrokes regardless, on the theory that pressing
+    keys into an unrecognised screen often advances the installer anyway. In
+    practice it just hid the failure -- a guest that panicked mid-install
+    marched through every remaining answer-file line and only failed much later,
+    somewhere unrelated. An audit of green CI runs found ZERO opts-file anchors
+    timing out, so the leniency was buying nothing. processOpts now aborts on a
+    timeout (see there).
+
+    NOTE the other callers -- start_and_wait and the per-OS host_installOpts /
+    host_waitForLoginTag hooks -- invoke this as a bare statement and ignore the
+    return, so their behaviour is unchanged. start_and_wait deliberately does
+    its own screen re-check plus a boot reroll after a login-tag timeout, which
+    is why VM_LOGIN_TAG timeouts DO legitimately appear in successful builds.
     """
     if not text:
         log("Usage: waitForText text [sec]"); return 1
@@ -2520,7 +2532,7 @@ def waitForText(text=None, sec="", hook=None):
         elif env("DEBUG"):
             log("Not found for text: %s" % text)
     log("Timeout for text: %s" % text)
-    return 0
+    return 1
 
 
 _startweb_thread = None
@@ -2975,11 +2987,26 @@ def processOpts(optsfile=None):
             log("========> Text:    %s" % text)
             log("========> Keys:    %s" % keys)
             log("========> Timeout: %s" % timeout)
-            if waitForText(text, timeout) == 0:
-                log("Input keys: %s" % keys)
-                input_cmd(keys)
-            else:
-                log("Timeout for waiting for text: %s" % text)
+            if waitForText(text, timeout) != 0:
+                # A timeout is FATAL, and stops the answer file right here.
+                # Previously it was logged and ignored: the keys were sent into
+                # whatever screen was up and the remaining lines ran anyway. On
+                # a guest that had died (random kernel panic mid-install is a
+                # normal event on these emulated platforms) that meant marching
+                # through every remaining line -- with all lines bounded that is
+                # sum(timeouts), tens of minutes of certain-to-fail work -- and
+                # then failing later somewhere unrelated, which buried the real
+                # cause. Audited 2026-07-27: across three full green CI runs no
+                # opts-file anchor ever timed out, so nothing legitimate relies
+                # on continuing past one.
+                log("FATAL: opts timeout waiting for screen text: %s" % text)
+                log("       (answer file %s, line: %s)" % (optsfile, line))
+                log("       The guest never showed this screen -- it most "
+                    "likely died (kernel panic / wedge) or an anchor no longer "
+                    "matches. Aborting the install instead of typing blind.")
+                return 1
+            log("Input keys: %s" % keys)
+            input_cmd(keys)
             time.sleep(1)
     return 0
 
@@ -3845,7 +3872,16 @@ def main(argv):
         time.sleep(2)
         openConsole()
         if not run_hook("installOpts"):
-            processOpts(opts)
+            if processOpts(opts) != 0:
+                # The answer file could not drive the installer to completion
+                # (see the FATAL line it just logged). Continuing would boot a
+                # half-installed disk and fail confusingly minutes later, so
+                # tear the VM down and fail the build here, where the log still
+                # shows the screen that never appeared.
+                log("install answer file failed; aborting")
+                destroyVM()
+                closeConsole()
+                return 1
             log("sleep 60 seconds. just wait")
             time.sleep(60)
             if isRunning() == 0:
