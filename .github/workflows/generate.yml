@@ -39,6 +39,7 @@ jobs:
           files: |
             base-builder/.github/tpl/build.tpl.yml : .github/workflows/build.yml
             base-builder/.github/tpl/manual.tpl.yml : .github/workflows/manual.yml
+            base-builder/.github/tpl/watch.tpl.yml : .github/workflows/watch.yml
             base-builder/.github/FUNDING.yml : .github/FUNDING.yml
             base-builder/.github/workflows/readme.yml : .github/workflows/readme.yml
             base-builder/.github/workflows/rerun.yml : .github/workflows/rerun.yml
@@ -56,6 +57,7 @@ jobs:
             .github/workflows/rerun.yml \
             .github/workflows/manual.yml \
             .github/workflows/build.yml \
+            .github/workflows/watch.yml \
             .github/tpl/README.tpl.md \
             .github/FUNDING.yml \
             build.py
