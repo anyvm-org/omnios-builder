@@ -4200,6 +4200,50 @@ def main(argv):
             log("======Show ssh config: ")
             subprocess.call(["ssh", osname, "cat /etc/ssh/sshd_config"])
 
+        # Actually RUN rsync in the guest -- do not merely name the package.
+        # This block used to log "Checking the packages: <names>" and then
+        # check nothing beyond ssh reachability, so an image whose rsync could
+        # not start still built, verified, and shipped green. netbsd-builder
+        # v2.1.6's 10.1-sparc64 image did exactly that: its root FFS was
+        # damaged at export (the poweroff-ack force-kill, gated off for
+        # sparc64 later the same day), fsck quietly repaired the metadata on
+        # every boot, and one casualty was a shared library rsync needs. The
+        # guest's rsync then died at dynamic-link time with "Shared object has
+        # no run-time symbol table", so every rsync sync against that image
+        # failed for days (anyvm run 30266282739) while the builder stayed
+        # green.
+        #
+        # Invoke it the way rsync(1) itself does: bare `rsync` over a
+        # NON-interactive ssh command. That is the same name resolution and
+        # the same PATH the real `rsync --server` gets on the far end, so this
+        # tests what actually matters. A binary that cannot print its version
+        # cannot serve a sync.
+        #
+        # VM_RSYNC_PKG is deliberately set-but-empty on images that have no
+        # rsync at all (netbsd 11.0 sparc64, the freebsd powerpc64/12.4 line,
+        # openindiana); those still enter this block via VM_SSHFS_PKG, so
+        # re-check it here rather than relying on the gate above.
+        if env("VM_RSYNC_PKG"):
+            rv = subprocess.run(["ssh", osname, "rsync --version"],
+                                capture_output=True)
+            rout = (rv.stdout or b"").decode("utf-8", "replace").strip()
+            rerr = (rv.stderr or b"").decode("utf-8", "replace").strip()
+            if rv.returncode != 0 or not rout:
+                log("verification FAILED: the guest cannot run rsync "
+                    "(VM_RSYNC_PKG=%s, rc=%d)"
+                    % (env("VM_RSYNC_PKG"), rv.returncode))
+                log("  stdout: %s" % (rout or "(empty)"))
+                log("  stderr: %s" % (rerr or "(empty)"))
+                log("  The package installed but the binary does not execute."
+                    " A corrupt shared library reads as 'Shared object has no"
+                    " run-time symbol table'; a missing one names the file;"
+                    " a PATH problem reads as 'command not found'. Do not"
+                    " ship this image -- rsync sync would fail for everyone"
+                    " who uses it.")
+                return 1
+            log("verification OK: guest rsync runs -- %s"
+                % rout.splitlines()[0])
+
         # Tear down the verification VM so its QEMU process doesn't outlive
         # this build. Otherwise its hostfwd holds VM_SSH_PORT and the next
         # build in the same workspace (run locally, or any CI runner reused
