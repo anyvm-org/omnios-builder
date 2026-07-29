@@ -492,6 +492,59 @@ def qemu_accel():
 OPENBSD_E1000_RELEASES = {"7.3", "7.4", "7.5", "7.6"}
 
 
+def netbsd_ctrl_vq_off(dev):
+    """Withdraw the virtio-net control virtqueue for NetBSD guests.
+
+    NetBSD's vioif(4) wedges FOREVER on a control-queue command whose
+    completion it never sees. if_vioif.c waits like this:
+
+        mutex_enter(&ctrlq->ctrlq_wait_lock);
+        while (ctrlq->ctrlq_inuse != DONE)
+                cv_wait(&ctrlq->ctrlq_wait, &ctrlq->ctrlq_wait_lock);
+
+    -- a cv_wait with NO timeout and no retry, woken only by the vq interrupt.
+    Miss that wakeup once and the interface is dead for the whole boot with
+    the interface lock held: dhcpcd (promisc for BPF -> CTRL_RX_PROMISC) and
+    mdnsd (multicast -> CTRL_MAC_TABLE_SET) sit in state D on wchan
+    "ctrl_vq", everything that touches the network afterwards queues up
+    behind them on "tstile", and even `ifconfig vioif0` never returns.
+
+    The guest still boots and runs rc, which is what makes it so confusing:
+    no DHCP lease, no address for the hostfwd to reach, zero guest-originated
+    packets, and rc stops at whichever service touches the network first. For
+    a BUILD that means _wait_ssh never connects -- it looks exactly like a
+    slow or hung boot, gets a reroll, and eventually times out.
+
+    Measured on netbsd 10.0-aarch64 v2.1.7 under QEMU 8.2.2 TCG: 14 hangs in
+    34 boots (41%).
+
+    vioif only compiles that path in when BOTH CTRL_VQ and CTRL_RX are
+    negotiated:
+
+        if ((features & VIRTIO_NET_F_CTRL_VQ) &&
+            (features & VIRTIO_NET_F_CTRL_RX)) { sc->sc_has_ctrl = true; ...
+
+    so withholding CTRL_VQ makes the wedge unreachable instead of merely
+    rarer: 10/10 clean boots with the knob vs 3/10 hangs without it in the
+    same interleaved run. Cost is only that the guest cannot program its RX
+    filters, so the NIC runs PROMISC,ALLMULTI and receives everything -- on a
+    private slirp segment that costs nothing. Verified working afterwards:
+    DHCP lease, default route, DNS, scp both directions.
+
+    Knobs that do NOT fix it, all measured -- do not "simplify" this into one
+    of them: event_idx=off (7 green/5 hang, same as baseline) and
+    -cpu cortex-a72 vs max (7/5 vs 6/6). -smp 1 makes it WORSE (7/10 hang).
+
+    Mirrors the same decoration in anyvm.py; the two must stay in step, and
+    the exported .qemu recipe inherits it because it is built from these args.
+    """
+    if (env("VM_OS_NAME") == "netbsd"
+            and dev.startswith("virtio-net")
+            and "ctrl_vq" not in dev):
+        return dev + ",ctrl_vq=off"
+    return dev
+
+
 def net_card():
     """Network device for -device.
 
@@ -515,8 +568,9 @@ def net_card():
     n = env("VM_NIC")
     if n:
         if n in ("virtio", "virtio-net"):
-            return "virtio-net-ccw" if arch == "s390x" else "virtio-net-pci"
-        return n
+            return netbsd_ctrl_vq_off(
+                "virtio-net-ccw" if arch == "s390x" else "virtio-net-pci")
+        return netbsd_ctrl_vq_off(n)
 
     osname = env("VM_OS_NAME")
     release = env("VM_RELEASE")
@@ -538,7 +592,7 @@ def net_card():
         nic = "virtio-net-pci"
     elif osname == "ubuntu":
         nic = "virtio-net-pci"
-    return nic
+    return netbsd_ctrl_vq_off(nic)
 
 
 # OpenBSD/amd64 release suffixes that imply a desktop image (X11). Mirrors
@@ -935,8 +989,12 @@ def build_qemu_args(media_kind=None, media_path=None):
         # enumerates "not configured" so the kernel can't find root ("boot
         # device: <unknown>" -> root device prompt). Use the MMIO virtio-*-device
         # variants for NetBSD; Ubuntu riscv64 keeps PCI.
+        # netbsd_ctrl_vq_off() applies here too: this branch builds the MMIO
+        # device name itself instead of going through net_card(), and NetBSD
+        # riscv64 runs the very same vioif(4) that wedges on the control queue.
         nb = env("VM_OS_NAME") == "netbsd"
-        netdev = "virtio-net-device,netdev=net0" if nb else "%s,netdev=net0" % nic
+        netdev = "%s,netdev=net0" % (
+            netbsd_ctrl_vq_off("virtio-net-device") if nb else nic)
         a += ["-device", "qemu-xhci", "-device", netdev]
         if not nb:
             a += ["-device", "virtio-balloon-pci"]
