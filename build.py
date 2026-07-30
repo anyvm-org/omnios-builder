@@ -857,10 +857,11 @@ def build_qemu_args(media_kind=None, media_path=None):
     # RTC: `driftfix=slew` matches libvirt's `<timer name='rtc' tickpolicy='catchup'/>`
     # -- when KVM drops RTC interrupts under load, slew the guest clock forward
     # instead of dropping ticks (illumos / older BSDs hate ticks vanishing).
-    # Haiku and Windows read the RTC as local time, not UTC; using UTC there
-    # offsets the wall clock by the timezone (TLS / cert breakage). Mirrors
-    # anyvm.py:5173-5176.
-    rtc_base = "localtime" if osname in ("windows", "haiku") else "utc"
+    # Haiku, Windows and ReactOS (an NT reimplementation, same convention)
+    # read the RTC as local time, not UTC; using UTC there offsets the wall
+    # clock by the timezone (TLS / cert breakage). Mirrors anyvm.py:5173-5176.
+    rtc_base = ("localtime" if osname in ("windows", "reactos", "haiku")
+                else "utc")
     # VM_MEMORY honours per-conf overrides; the default 6144 covers the
     # bulk of guests. RISC-V virt machines place the FDT blob near the top
     # of RAM, and Ubuntu 22.04 riscv64's u-boot puts it right at the 8 GB
@@ -888,14 +889,16 @@ def build_qemu_args(media_kind=None, media_path=None):
         netdev += (",hostfwd=tcp:127.0.0.1:%s-192.168.122.254:564"
                    % env("VM_9P_PORT"))
     a += ["-netdev", netdev]
-    # virtio-rng-pci for all guests EXCEPT solaris, sparc64 and s390x --
-    # Solaris does not have a virtio-rng driver and the unrecognized device
-    # disrupts early boot; the QEMU sun4u (sparc64) machine has no free PCI
-    # slot for it ("PCI: no slot/function available for virtio-rng-pci") and
-    # NetBSD/sparc64 has no virtio bus on sun4u anyway, so QEMU would abort
-    # at launch; s390x devices live on the CCW bus (its branch adds
-    # virtio-rng-ccw instead). Mirrors anyvm.py:5627.
-    if osname != "solaris" and arch not in ("sparc64", "s390x"):
+    # virtio-rng-pci for all guests EXCEPT solaris, reactos, sparc64 and
+    # s390x -- Solaris does not have a virtio-rng driver and the unrecognized
+    # device disrupts early boot; ReactOS has no virtio-rng driver either and
+    # reacts by popping a MODAL "New Hardware Wizard" on the desktop, which
+    # in an unattended build nobody is there to dismiss; the QEMU sun4u
+    # (sparc64) machine has no free PCI slot for it ("PCI: no slot/function
+    # available for virtio-rng-pci") and NetBSD/sparc64 has no virtio bus on
+    # sun4u anyway, so QEMU would abort at launch; s390x devices live on the
+    # CCW bus (its branch adds virtio-rng-ccw instead). Mirrors anyvm.py:5627.
+    if osname not in ("solaris", "reactos") and arch not in ("sparc64", "s390x"):
         a += ["-object", "rng-builtin,id=rng0",
               "-device", "virtio-rng-pci,rng=rng0,max-bytes=1024,period=1000"]
 
@@ -1264,7 +1267,13 @@ def build_qemu_args(media_kind=None, media_path=None):
         # so it's a no-op under TCG / HVF.
         if accel == "kvm":
             a += ["-global", "kvm-pit.lost_tick_policy=delay"]
-        a += ["-device", "%s,netdev=net0" % nic, "-device", "virtio-balloon-pci"]
+        a += ["-device", "%s,netdev=net0" % nic]
+        # ReactOS has no virtio-balloon driver, and an unclaimed PCI device
+        # makes it pop a modal "New Hardware Wizard" over the desktop that an
+        # unattended build has nobody to dismiss. Same reasoning as the
+        # virtio-rng skip above.
+        if osname != "reactos":
+            a += ["-device", "virtio-balloon-pci"]
         # CDROM / disk IDE-slot placement -- two layouts depending on whether
         # the main disk itself sits on the IDE bus.
         #
@@ -1323,6 +1332,19 @@ def build_qemu_args(media_kind=None, media_path=None):
                   "-device", "usb-storage,drive=seed0"]
         else:
             a += ["-drive", "file=%s,format=raw,if=ide,index=2,media=cdrom" % seed]
+
+    # VM_QEMU_NO_REBOOT: end the ISO-install phase at the installer's own
+    # reboot. Normally the installer is driven to a shutdown by the answer
+    # file, but some installers (ReactOS usetup in unattended mode) finish
+    # first stage by rebooting unconditionally -- and with "-boot order=dc"
+    # that reboot lands back on the install CD and restarts setup in an
+    # infinite reformat loop. "-no-reboot" makes QEMU exit instead, which is
+    # exactly the signal main() already waits for right after the installOpts
+    # hook (_wait_vm_down(what="install")). Only ever added for the cdrom
+    # (install) launch: the later startVM boots the disk with no media and
+    # must be free to reboot normally.
+    if media_kind == "cdrom" and env("VM_QEMU_NO_REBOOT"):
+        a += ["-no-reboot"]
 
     # VNC display number = port - 5900 (display :N <-> TCP 5900+N).
     a += ["-display", "vnc=127.0.0.1:%d" % (vncport - 5900)]
@@ -1421,7 +1443,7 @@ def _profile_rng():
     arch = env("VM_ARCH") or "x86_64"
     if arch == "s390x":
         return "ccw"
-    if env("VM_OS_NAME") == "solaris" or arch == "sparc64":
+    if env("VM_OS_NAME") in ("solaris", "reactos") or arch == "sparc64":
         return "none"
     return "pci"
 
@@ -1463,6 +1485,10 @@ def _profile_balloon():
     except NetBSD (its GENERIC64 cannot drive the PCI balloon); never on aarch64
     / s390x / sparc64 / pseries."""
     arch = env("VM_ARCH") or "x86_64"
+    if env("VM_OS_NAME") == "reactos":
+        # No virtio-balloon driver; an unclaimed PCI device raises a modal
+        # New Hardware Wizard over the desktop.
+        return False
     if arch in ("x86_64", "i386"):
         # i386 (hurd) runs through the same PC-class else-branch of
         # build_qemu_args(), which attaches the balloon unconditionally.
@@ -1532,10 +1558,11 @@ def build_guest_profile():
         "firmware_kind": _profile_firmware_kind(),
         "qemu_min_version": _profile_qemu_min_version(),
         "balloon": _profile_balloon(),
-        # RTC epoch the guest expects: windows/haiku read the CMOS clock as
-        # local time, everything else as UTC. Mirrors build_qemu_args()'s
-        # rtc_base and anyvm.py's.
-        "rtc_base": "localtime" if osname in ("windows", "haiku") else "utc",
+        # RTC epoch the guest expects: windows/reactos/haiku read the CMOS
+        # clock as local time, everything else as UTC. Mirrors
+        # build_qemu_args()'s rtc_base and anyvm.py's.
+        "rtc_base": ("localtime" if osname in ("windows", "reactos", "haiku")
+                     else "utc"),
         "console": bool(env("VM_USE_CONSOLE_BUILD")),
         # Remote-exec channel into the guest: "ssh" for everything except
         # VM_TRANSPORT=telnet guests (plan9: telnetd on 23, exportfs 9P on
@@ -3279,9 +3306,19 @@ def telnet_exec(cmds, settle=2.0, port=None):
 def _telnet_ready_check():
     """One telnet probe: connect, run a marker echo, look for the marker in
     the output. The quoted split in the sent line keeps the guest's echo of
-    the command itself from matching."""
-    ok, text = telnet_exec(["echo anyvm''-ready"], settle=2.0)
-    return ok and ("anyvm-ready" in text)
+    the command itself from matching.
+
+    The default probe is Plan 9 rc syntax. The shell behind the guest's
+    telnetd is NOT universal -- ReactOS answers with cmd.exe, where `''` is
+    not a quote-splitter at all and the probe could never match. A conf can
+    therefore override both halves; the pair must keep the same property,
+    that the marker appears in the OUTPUT but not in the guest's echo of the
+    command line itself (cmd.exe: `echo anyvm^-ready` prints `anyvm-ready`
+    while echoing the caret)."""
+    probe = env("VM_TELNET_PROBE_CMD") or "echo anyvm''-ready"
+    marker = env("VM_TELNET_PROBE_MARKER") or "anyvm-ready"
+    ok, text = telnet_exec([probe], settle=2.0)
+    return ok and (marker in text)
 
 
 def _wait_telnet(max_retries=100, restart_cb=None):
