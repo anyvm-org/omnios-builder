@@ -4335,6 +4335,26 @@ def main(argv):
                     " a PATH problem reads as 'command not found'. Do not"
                     " ship this image -- rsync sync would fail for everyone"
                     " who uses it.")
+                # Autopsy while the corpse is still warm: this failure
+                # reproduces on CI but not locally (10.1-sparc64,
+                # 2026-08-02: same conf, same packages, same patched QEMU
+                # -- local build green, CI deterministically red), so the
+                # failing CI run is the ONLY place the corrupt file can be
+                # named. pkg_admin check re-hashes every installed file
+                # against the recorded checksums (NetBSD pkg_install; on
+                # other guests it just prints command-not-found, which is
+                # fine -- these lines are diagnostics, never a gate), and
+                # ldd shows which object the loader trips on.
+                for probe in ("ldd $(command -v rsync) 2>&1",
+                              "pkg_admin check 2>&1 | grep -v OK | tail -40",
+                              "df -h; mount"):
+                    pv = subprocess.run(["ssh", osname, probe],
+                                        capture_output=True)
+                    log("  autopsy `%s`:\n%s" % (
+                        probe,
+                        (pv.stdout or b"").decode("utf-8",
+                                                  "replace").strip()
+                        or "(no output)"))
                 return 1
             log("verification OK: guest rsync runs -- %s"
                 % rout.splitlines()[0])
