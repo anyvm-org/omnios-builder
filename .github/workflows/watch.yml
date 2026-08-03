@@ -1,10 +1,10 @@
 name: "Watch upstream"
 
-# Track this OS upstream and land the confs for a new release. The
-# generation layer does the rest: landing a conf on main makes
-# generate.yml regenerate all.release.conf / the tables / releases.json
-# and re-render build.yml with the new matrix, and that commit starts the
-# build. See base-builder/watch.py.
+# Track this OS upstream and land the confs for a new release, switching
+# them on in conf/all.release.conf (the hand-owned build membership).
+# The generation layer does the rest: landing on main makes generate.yml
+# regenerate the tables / releases.json and re-render build.yml with the
+# new matrix, and that commit starts the build. See base-builder/watch.py.
 
 permissions:
   contents: write
@@ -39,7 +39,8 @@ jobs:
             "${RUNNER_TEMP}/anyvm"
           python3 base-builder/watch.py \
             --allow-file "${RUNNER_TEMP}/anyvm/.github/coverage.allow" \
-            --allow-out "${RUNNER_TEMP}/allow-lines.txt"
+            --allow-out "${RUNNER_TEMP}/allow-lines.txt" \
+            --landed-out "${RUNNER_TEMP}/landed.txt"
 
       - name: Commit and push changes
         run: |
@@ -82,6 +83,56 @@ jobs:
               exit 1
             fi
           fi
+
+      # A SILENT SUCCESS is a miss too: midnightbsd 4.0.7 landed and built
+      # green on 2026-08-01 and the maintainer never heard about it,
+      # although the one remaining human action -- cutting the builder
+      # release tag -- was now wanted. So a successful landing opens a
+      # notification issue that doubles as the to-do: close it when the
+      # tag is cut. One issue per version (deduped by exact title), so a
+      # re-run never posts twice.
+      - name: Report a landed release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          if [ ! -s "${RUNNER_TEMP}/landed.txt" ]; then
+            echo "nothing landed, no notification"
+            exit 0
+          fi
+          read -r action version < "${RUNNER_TEMP}/landed.txt"
+          TITLE="upstream release landed: ${version}"
+          export TITLE
+          num=$(gh issue list --state open --limit 100 \
+                  --json number,title \
+                  --jq "[.[] | select(.title == env.TITLE)] | .[0].number // empty")
+          if [ -n "$num" ]; then
+            echo "issue #${num} already open for ${version}"
+            exit 0
+          fi
+          {
+            if [ "$action" = "refresh" ]; then
+              echo "The watcher refreshed ${version}'s confs to the final"
+              echo "upstream media (the RC pins are gone) and the rebuild"
+              echo "has been triggered."
+            else
+              echo "The watcher landed conf(s) for upstream release ${version}"
+              echo "and the build matrix now includes it."
+            fi
+            echo
+            echo "Run: ${RUN_URL}"
+            echo
+            echo "Next step (the one remaining human action): once the"
+            echo "Build workflow is green, cut a new release tag on this"
+            echo "repo -- the images and releases.json upload themselves,"
+            echo "and the version bump bots propagate the tag to the"
+            echo "*-vm actions and anyvm the same night."
+            echo
+            echo "Close this issue once the tag is cut."
+          } > "${RUNNER_TEMP}/landed-issue.txt"
+          gh issue create --title "${TITLE}" \
+            --body-file "${RUNNER_TEMP}/landed-issue.txt"
 
       # A nightly cron nobody reads is not a watcher. A failure here means
       # either the detection hook broke (upstream redesigned its page) or

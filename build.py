@@ -1511,8 +1511,14 @@ def build_guest_profile():
     # virtio over the MMIO transport there (virtio-blk-device / virtio-net-device).
     mmio = (osname == "netbsd" and arch == "riscv64")
     nic = net_card()
-    if mmio and nic == "virtio-net-pci":
-        nic = "virtio-net-device"
+    if mmio and nic.startswith("virtio-net-pci"):
+        # startswith, NOT ==: net_card() returns the model WITH option
+        # flags ("virtio-net-pci,ctrl_vq=off" on netbsd), so an exact
+        # match silently skipped the translation and the profile shipped
+        # a PCI NIC name for a guest with no PCI virtio bus -- anyvm.py
+        # took it verbatim and booted netbsd riscv64 with no NIC at all
+        # (netbsd-vm run 30776357735, dhcpcd "no valid interfaces found").
+        nic = nic.replace("virtio-net-pci", "virtio-net-device", 1)
     # disk bus. build_qemu_args()'s sparc64 (sun4u) branch hardwires the disk
     # to IDE (wd0) and never consults disk_if(), whose generic default would
     # say virtio -- record the real bus here.
