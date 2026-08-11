@@ -862,6 +862,21 @@ def build_qemu_args(media_kind=None, media_path=None):
     # clock by the timezone (TLS / cert breakage). Mirrors anyvm.py:5173-5176.
     rtc_base = ("localtime" if osname in ("windows", "reactos", "haiku")
                 else "utc")
+    # ReactOS is the one guest that must NOT get driftfix. Its HAL sizes every
+    # busy-wait from the loop iterations counted between two RTC (IRQ8)
+    # periodic interrupts (HalpCalibrateStallExecution,
+    # hal/halx86/generic/systimer.S). driftfix=slew replays interrupts the
+    # guest was too slow to take, so without full hardware virtualisation the
+    # two calibration interrupts land back to back, StallScaleFactor is stored
+    # as 0, and KeStallExecutionProcessor's `sub eax,1 / jnz` starts from 0 and
+    # wraps to 2^32 iterations -- ~8.7 s for every stall, so the guest never
+    # finishes booting. Measured on the released image under pure TCG:
+    # slew -> factor 0, never booted; no driftfix -> factor 1011, booted in
+    # 68 s. The build itself runs under KVM (where the factor comes out fine
+    # either way), but the exported .qemu recipe is replayed by users on
+    # hosts that have no KVM, so it must not carry driftfix.
+    rtc_opts = ("base=%s,clock=host" % rtc_base if osname == "reactos"
+                else "base=%s,clock=host,driftfix=slew" % rtc_base)
     # VM_MEMORY honours per-conf overrides; the default 6144 covers the
     # bulk of guests. RISC-V virt machines place the FDT blob near the top
     # of RAM, and Ubuntu 22.04 riscv64's u-boot puts it right at the 8 GB
@@ -871,7 +886,7 @@ def build_qemu_args(media_kind=None, media_path=None):
     # other guest's footprint.
     a += ["-name", osname, "-m", env("VM_MEMORY") or "6144",
           "-smp", env("VM_CPU") or "2",
-          "-rtc", "base=%s,clock=host,driftfix=slew" % rtc_base]
+          "-rtc", rtc_opts]
     # slirp DHCP pinned to .254 (see SLIRP_EXPECTED_GUEST_IP for rationale).
     # hostfwd target is the explicit guest IP so port forwarding never races
     # the guest's DHCP-bound state.
