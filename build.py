@@ -405,6 +405,9 @@ def detect_guest_ip(osname=None):
 def qemu_bin_name():
     a = env("VM_ARCH") or "x86_64"
     if a == "aarch64": return "qemu-system-aarch64"
+    # 32-bit ARM: QEMU spells the binary "arm", not after the profile, so the
+    # generic "qemu-system-" + arch fallback below would miss it.
+    if a in ("armv7", "arm"): return "qemu-system-arm"
     if a == "riscv64": return "qemu-system-riscv64"
     if a == "sparc64": return "qemu-system-sparc64"
     if a == "s390x": return "qemu-system-s390x"
@@ -577,6 +580,11 @@ def net_card():
 
     if arch == "s390x":
         return "virtio-net-ccw"
+    if arch == "armv7":
+        # raspi2b has no PCI bus, so the e1000 default below would abort QEMU
+        # at launch. The board's real NIC is an SMSC LAN9512 behind the
+        # on-chip USB hub, which is also the only model RISC OS can drive.
+        return "usb-net-smsc95xx"
     nic = "virtio-net-pci" if arch == "aarch64" else "e1000"
     if osname == "openbsd" and release:
         release_base = release.split("-")[0]
@@ -875,7 +883,13 @@ def build_qemu_args(media_kind=None, media_path=None):
     # 68 s. The build itself runs under KVM (where the factor comes out fine
     # either way), but the exported .qemu recipe is replayed by users on
     # hosts that have no KVM, so it must not carry driftfix.
-    rtc_opts = ("base=%s,clock=host" % rtc_base if osname == "reactos"
+    # RISC OS is excluded too, for the same class of reason as ReactOS: the
+    # Raspberry Pi has no mc146818 RTC for driftfix to act on, and RISC OS
+    # calibrates its own delay loops from timer interrupts. Every boot that
+    # has been verified for this guest ran without driftfix, so do not start
+    # adding it on the strength of it "probably being a no-op".
+    rtc_opts = ("base=%s,clock=host" % rtc_base
+                if osname in ("reactos", "riscos")
                 else "base=%s,clock=host,driftfix=slew" % rtc_base)
     # VM_MEMORY honours per-conf overrides; the default 6144 covers the
     # bulk of guests. RISC-V virt machines place the FDT blob near the top
@@ -913,7 +927,11 @@ def build_qemu_args(media_kind=None, media_path=None):
     # available for virtio-rng-pci") and NetBSD/sparc64 has no virtio bus on
     # sun4u anyway, so QEMU would abort at launch; s390x devices live on the
     # CCW bus (its branch adds virtio-rng-ccw instead). Mirrors anyvm.py:5627.
-    if osname not in ("solaris", "reactos") and arch not in ("sparc64", "s390x"):
+    # armv7 (raspi2b) is excluded for a blunter reason than the others: the
+    # Raspberry Pi has no PCI bus at all, so QEMU aborts at launch rather than
+    # merely confusing the guest.
+    if (osname not in ("solaris", "reactos")
+            and arch not in ("sparc64", "s390x", "armv7")):
         a += ["-object", "rng-builtin,id=rng0",
               "-device", "virtio-rng-pci,rng=rng0,max-bytes=1024,period=1000"]
 
@@ -1227,6 +1245,48 @@ def build_qemu_args(media_kind=None, media_path=None):
         else:
             a += ["-device", "virtio-blk-pci,drive=disk0,bootindex=0"]
 
+    elif arch == "armv7":
+        # RISC OS on a Raspberry Pi 2. The only 32-bit ARM guest here, and the
+        # only one whose machine is a real board rather than QEMU's `virt`:
+        # RISC OS drives BCM2835 peripherals directly and knows nothing about
+        # PCI, virtio or UEFI. Everything the other branches reach for --
+        # virtio-blk, a PCI NIC, a VGA adapter, pflash firmware -- has no bus
+        # to sit on here, which is why this branch adds so little.
+        #
+        # Requires the patched QEMU riscos-builder publishes (VM_QEMU_TAR):
+        # stock QEMU cannot boot RISC OS on any raspi machine.
+        #
+        # No -cpu and no accel option: raspi2b fixes the CPU at Cortex-A7 and
+        # the board models are TCG-only. -m and -smp must match the board
+        # exactly (1G, 4 cores) or QEMU refuses to start, so the conf pins
+        # VM_MEMORY=1024 and VM_CPU=4.
+        a += ["-machine", "raspi2b"]
+        # The ROM arrives through -bios, added above from VM_BIOS -- the raspi
+        # machines have no firmware of their own for QEMU to fall back on.
+        #
+        # SD card, not a disk controller: these boards boot off the SD
+        # interface and RISC OS's SDFS is what reads it. QEMU's SD model also
+        # insists on a power-of-two image, which is why the prepareImage hook
+        # resizes (ROOL's is 1966080000 bytes).
+        a += ["-drive", "file=%s,format=qcow2,if=sd" % qcow]
+        # The NIC hangs off the on-chip USB hub. A real Pi 2 carries an SMSC
+        # LAN9512, RISC OS has a driver for that and for nothing else QEMU
+        # offers (no virtio-net, no e1000), so this is not a preference --
+        # without it the guest has no networking at all and the build can
+        # never reach its agent. The device model ships in the QEMU patch.
+        # Taken from net_card() so the conf's VM_NIC stays authoritative,
+        # the same as every other branch.
+        a += ["-device", "%s,netdev=net0" % nic]
+        # Video is the BCM2835 framebuffer via the mailbox, so no -vga and no
+        # display device: the machine provides its own.
+        if media_kind:
+            # Nothing to attach it to, and no installer to run it -- this
+            # guest is a prepared disc image. Fail loudly rather than boot a
+            # VM that silently ignores the media.
+            log("FATAL: armv7/raspi2b has nowhere to attach install media "
+                "(%s); this guest installs offline, not from media" % media_kind)
+            sys.exit(1)
+
     else:
         # x86_64 (and any other PC-class arch).
         pc_mopts = "pc,accel=%s,hpet=off,smm=off,graphics=on,vmport=off,usb=on" % accel
@@ -1407,6 +1467,12 @@ def _profile_machine():
         return "virt", opts
     if arch == "riscv64":
         return "virt", "usb=on,acpi=off"
+    if arch == "armv7":
+        # A real board, not `virt`: RISC OS drives BCM2835 peripherals
+        # directly. No options at all -- raspi2b fixes CPU, RAM and core count
+        # itself, and it is TCG-only, so there is nothing here for the host to
+        # vary.
+        return "raspi2b", ""
     if arch == "loongarch64":
         return "virt", ""
     if arch == "s390x":
@@ -1446,8 +1512,9 @@ def _profile_cpu_model():
         return "qemu"
     if arch in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
         return "power9"
-    # sparc64 (sun4u carries no -cpu) and x86_64 (anyvm.py picks qemu64 under
-    # TCG, host/Broadwell-v4 under KVM -- all host-aware) record no model.
+    # sparc64 (sun4u carries no -cpu), armv7 (raspi2b fixes it at Cortex-A7)
+    # and x86_64 (anyvm.py picks qemu64 under TCG, host/Broadwell-v4 under
+    # KVM -- all host-aware) record no model.
     return None
 
 
@@ -1458,7 +1525,10 @@ def _profile_rng():
     arch = env("VM_ARCH") or "x86_64"
     if arch == "s390x":
         return "ccw"
-    if env("VM_OS_NAME") in ("solaris", "reactos") or arch == "sparc64":
+    if (env("VM_OS_NAME") in ("solaris", "reactos")
+            or arch in ("sparc64", "armv7")):
+        # armv7 is raspi2b, which has no PCI bus at all -- QEMU aborts at
+        # launch rather than merely leaving the device unclaimed.
         return "none"
     return "pci"
 
@@ -3734,11 +3804,15 @@ def _prep_vhd_disk(link):
                 must_sh(tarcmd, "tar extract %s (corrupt download?)" % tarball)
         must_run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
                   "-o", "preallocation=off", img, qcow], "qemu-img convert")
-    elif link.endswith("img.zip"):
+    elif link.endswith(".zip"):
         # Zip archive holding a single raw *.img member whose name carries a
         # per-build timestamp (NextBSD publishes
         # NextBSD-amd64-20260724-211803.img.zip and refreshes it on every
         # push, so the member name can never be spelled out in a conf).
+        # Matched on ".zip" rather than "img.zip" so an upstream that does not
+        # advertise the member in its filename still lands here: RISC OS Open
+        # publishes RISCOSPi.<ver>.zip holding riscos-pi.img. The member is
+        # found by suffix either way, so nothing else changes.
         # Extract by suffix instead. Python's zipfile is used rather than
         # unzip(1) so no extra host package is needed on any platform.
         # The extracted .img is KEPT (same retry-cache semantics as the
