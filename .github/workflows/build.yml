@@ -14,6 +14,13 @@ on:
       - '*.txt'
       - 'conf/*'
       - 'hooks/*'
+      # files/ decides what gets built just as much as hooks/ does: the
+      # patched QEMU sources and build scripts (netbsd, openbsd, ubuntu,
+      # riscos), reactos's anyvmtd.c and inject.sh, riscos's agent and its
+      # FileCore injector. Without this a fix to any of them lands on main
+      # and nothing rebuilds -- riscos-builder pushed a rofilecore.py fix and
+      # no run started at all.
+      - 'files/*'
   pull_request:
     branches:
       - '*'
@@ -23,6 +30,13 @@ on:
       - '*.txt'
       - 'conf/*'
       - 'hooks/*'
+      # files/ decides what gets built just as much as hooks/ does: the
+      # patched QEMU sources and build scripts (netbsd, openbsd, ubuntu,
+      # riscos), reactos's anyvmtd.c and inject.sh, riscos's agent and its
+      # FileCore injector. Without this a fix to any of them lands on main
+      # and nothing rebuilds -- riscos-builder pushed a rofilecore.py fix and
+      # no run started at all.
+      - 'files/*'
   workflow_dispatch:
 
   release:
