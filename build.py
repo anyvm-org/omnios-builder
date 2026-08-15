@@ -3778,6 +3778,19 @@ def _prep_vhd_disk(link):
             must_run(["zstd", "-f", "-d", img + ".zst", "-o", img], "zstd decompress")
         must_run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
                   "-o", "preallocation=off", img, qcow], "qemu-img convert")
+    elif link.endswith("img.bz2"):
+        # bzip2-compressed raw image. OPNsense is the upstream that needs
+        # this (OPNsense-<ver>-nano-amd64.img.bz2); bzip2 is already a build
+        # dependency for the ISO path above, so nothing new is installed.
+        img = wf("%s.img" % osname)
+        if not os.path.exists(img):
+            try: os.remove(img + ".bz2")
+            except OSError: pass
+            download(link, img + ".bz2")
+            must_sh("bzip2 -dc %s.bz2 > %s" % (shlex.quote(img), shlex.quote(img)),
+                    "bzip2 decompress %s.bz2 (corrupt download?)" % img)
+        must_run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
+                  "-o", "preallocation=off", img, qcow], "qemu-img convert")
     elif link.endswith("img.tar.gz") or link.endswith("img.tar.xz"):
         # Tarball holding a single raw *.img member whose name varies per
         # snapshot (e.g. Debian GNU/Hurd publishes
