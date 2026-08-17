@@ -3458,6 +3458,49 @@ def _wait_telnet(max_retries=100, restart_cb=None):
     return True
 
 
+# Wall-clock ceiling for a one-shot `ssh <host> <short command>`. 600 s to
+# match the other guest-operation backstops in this file (shutdown_and_wait
+# and the pre-export verify boot both use 600), and deliberately NOT sized
+# from "how long does a cat take" -- these are crash backstops, not
+# performance budgets. See _ssh_run for what happens when it fires.
+SSH_CMD_TIMEOUT = 600
+
+
+def _ssh_run(argv, timeout=None, **kw):
+    """subprocess.run for a one-shot ssh command, but BOUNDED.
+
+    Every plain `subprocess.run(["ssh", ...])` in this file used to be
+    unbounded. On 2026-08-17 one of them -- the authorized_keys assertion in
+    main() -- hung a haiku build for 1 h 41 m against a guest that was
+    provably healthy: an independent ssh answered `uname -a` in under 20 s,
+    and the forwarded port was still listening, while the build's own client
+    sat in poll() forever. Note that ~/.ssh/config's ServerAliveInterval=1
+    does NOT cover this case: keepalives were being answered, so the
+    connection never looked dead -- it was the command that never returned.
+    Only a wall-clock ceiling catches that.
+
+    Returns a CompletedProcess. On timeout the client is killed and a
+    synthetic rc of 124 is reported (GNU timeout's convention) along with
+    whatever output had already arrived. Callers can therefore separate
+    three outcomes, which matters because ssh reserves 255 for its own
+    failures and otherwise propagates the remote command's status:
+
+        rc == 0            the command ran and succeeded
+        rc in (124, 255)   transport: we never got an answer from the guest
+        any other rc       the command ran on the guest and failed
+    """
+    if timeout is None:
+        timeout = SSH_CMD_TIMEOUT
+    try:
+        return subprocess.run(argv, timeout=timeout, **kw)
+    except subprocess.TimeoutExpired as exc:
+        log("ssh command exceeded %d s and was killed: %s"
+            % (timeout, " ".join(argv[1:]) or "(no command)"))
+        return subprocess.CompletedProcess(argv, 124,
+                                           exc.stdout or b"",
+                                           exc.stderr or b"")
+
+
 def _ssh_ready_check(timeout=None):
     """Probe `ssh $VM_OS_NAME exit` with `-v` so the caller can inspect why
     the connection failed (auth refused, no route, perm denied, banner
@@ -4161,7 +4204,7 @@ def main(argv):
             'echo "     User %s" >>.ssh/config\n'
             'echo "     ServerAliveInterval 1" >>.ssh/config\n'
         ) % user
-        subprocess.run(["ssh", osname, "sh"], input=ssh_init.encode())
+        _ssh_run(["ssh", osname, "sh"], input=ssh_init.encode())
 
     if run_hook("postBuild"):
         if restart_and_wait() != 0:
@@ -4188,7 +4231,7 @@ def main(argv):
                     f.write(src.read())
     else:
         with open("%s-id_rsa.pub" % output, "w") as f:
-            subprocess.run(["ssh", osname, "cat ~/.ssh/id_rsa.pub"], stdout=f)
+            _ssh_run(["ssh", osname, "cat ~/.ssh/id_rsa.pub"], stdout=f)
 
     if env("VM_PRE_INSTALL_PKGS"):
         inst_script = env("VM_INSTALL_SCRIPT")
@@ -4310,17 +4353,49 @@ def main(argv):
         # about to be exported, so this is the shipped content. cat returns
         # non-zero if the file is missing; empty stdout means an empty file;
         # otherwise the trailing-byte test is unambiguous here.
-        r = subprocess.run(["ssh", osname, "cat ~/.ssh/authorized_keys"],
-                           capture_output=True)
-        ak = r.stdout
-        log("======Show authorized_keys: ")
-        log(ak.decode("utf-8", "replace").rstrip("\n"))
-        if r.returncode != 0 or not ak or not ak.endswith(b"\n"):
-            log("verification FAILED: ~/.ssh/authorized_keys is missing, empty, "
-                "or has no trailing newline (rc=%d, %d bytes)"
-                % (r.returncode, len(ak)))
-            return 1
-        log("verification OK: authorized_keys ends with a trailing newline")
+        #
+        # Bounded, and a transport failure is NOT a content verdict. Both
+        # halves come from one incident (2026-08-17, haiku r1beta5): the
+        # unbounded call hung 1 h 41 m on a healthy guest, and when the
+        # wedged client was finally killed the 798 bytes had in fact arrived
+        # and DID end in a newline -- yet the old `r.returncode != 0 or ...`
+        # reported "missing, empty, or has no trailing newline (rc=255)".
+        # That is precisely the mis-failing of a perfectly good file that the
+        # cat-and-judge-in-Python rewrite above exists to prevent.
+        #
+        # A MISSING file must still sink the build, so the rc cases are kept
+        # apart rather than all lumped into "transport": ssh uses 255 for its
+        # own failures and 124 is _ssh_run's timeout, while a plain `cat` of a
+        # nonexistent file exits 1. So 124/255 => could not ask the guest;
+        # any other non-zero => the guest answered and the file is not there.
+        # One retry on a FRESH connection, because a new connection is what
+        # demonstrably worked while the first client was stuck.
+        ak = None
+        for ak_attempt in (1, 2):
+            r = _ssh_run(["ssh", osname, "cat ~/.ssh/authorized_keys"],
+                         capture_output=True)
+            if r.returncode == 0:
+                ak = r.stdout
+                break
+            if r.returncode not in (124, 255):
+                log("verification FAILED: ~/.ssh/authorized_keys could not be "
+                    "read on the guest (rc=%d) -- the file is missing"
+                    % r.returncode)
+                return 1
+            log("authorized_keys read did not reach the guest "
+                "(attempt %d/2, rc=%d)" % (ak_attempt, r.returncode))
+        if ak is None:
+            log("authorized_keys check: two attempts could not reach the "
+                "guest over ssh; skipping the assertion rather than failing "
+                "a build on a transport fault (the image itself may be fine)")
+        else:
+            log("======Show authorized_keys: ")
+            log(ak.decode("utf-8", "replace").rstrip("\n"))
+            if not ak.endswith(b"\n"):
+                log("verification FAILED: ~/.ssh/authorized_keys is empty or "
+                    "has no trailing newline (%d bytes)" % len(ak))
+                return 1
+            log("verification OK: authorized_keys ends with a trailing newline")
     else:
         log("authorized_keys check: build VM not ssh-reachable here; skipping "
             "(not failing -- some console-only images have no ssh at this point)")
@@ -4427,8 +4502,8 @@ def main(argv):
         # openindiana); those still enter this block via VM_SSHFS_PKG, so
         # re-check it here rather than relying on the gate above.
         if env("VM_RSYNC_PKG"):
-            rv = subprocess.run(["ssh", osname, "rsync --version"],
-                                capture_output=True)
+            rv = _ssh_run(["ssh", osname, "rsync --version"],
+                          capture_output=True)
             rout = (rv.stdout or b"").decode("utf-8", "replace").strip()
             rerr = (rv.stderr or b"").decode("utf-8", "replace").strip()
             if rv.returncode != 0 or not rout:
@@ -4456,8 +4531,8 @@ def main(argv):
                 for probe in ("ldd $(command -v rsync) 2>&1",
                               "pkg_admin check 2>&1 | grep -v OK | tail -40",
                               "df -h; mount"):
-                    pv = subprocess.run(["ssh", osname, probe],
-                                        capture_output=True)
+                    pv = _ssh_run(["ssh", osname, probe],
+                                  capture_output=True)
                     log("  autopsy `%s`:\n%s" % (
                         probe,
                         (pv.stdout or b"").decode("utf-8",
