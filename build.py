@@ -1318,10 +1318,21 @@ def build_qemu_args(media_kind=None, media_path=None):
                 cpu = "host,kvm=on,l3-cache=on,+hypervisor,migratable=no,+invtsc"
                 if host_nested_amd_with_avx512():
                     # See host_nested_amd_with_avx512(): nested AMD-V corrupts
-                    # guest AVX512 XSAVE state; drop just avx512f so glibc
-                    # falls back to its AVX2 paths.
-                    cpu += ",-avx512f"
-                    log("Nested AMD KVM detected: dropping AVX512 from -cpu host")
+                    # guest AVX512 XSAVE state. Dropping avx512f alone is NOT
+                    # enough: QEMU does not cascade-disable the sub-features,
+                    # and kernel code gates on them directly -- Rocky 10's
+                    # chacha20poly1305 boot selftest checks avx512vl/bw and
+                    # panicked in chacha_8block_xor_avx512vl with avx512f
+                    # already masked (local build, 2026-08-24). Disable the
+                    # whole family; every name below exists in QEMU >= 8.2
+                    # (the fleet floor) and disabling a feature the guest
+                    # would not get anyway is a no-op.
+                    cpu += (",-avx512f,-avx512dq,-avx512ifma,-avx512cd"
+                            ",-avx512bw,-avx512vl,-avx512vbmi,-avx512vbmi2"
+                            ",-avx512vnni,-avx512bitalg,-avx512-vpopcntdq"
+                            ",-avx512-bf16,-avx512-fp16,-avx512-vp2intersect")
+                    log("Nested AMD KVM detected: dropping the AVX512 family "
+                        "from -cpu host")
         elif accel == "hvf":
             cpu = "host,+rdrand,+rdseed"
         else:
