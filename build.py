@@ -1498,6 +1498,17 @@ def _profile_machine():
         # hurd branch in build_qemu_args).
         return ("pc" if arch == "i386" else "q35",
                 "smm=off,graphics=on,vmport=off,usb=on")
+    if env("VM_MICROVM"):
+        # QEMU 'microvm' machine: no PCI, no ACPI, virtio over MMIO, direct
+        # kernel boot (PVH -kernel). The BUILD itself still runs on 'pc' --
+        # the installer ISO needs a BIOS bootloader and the enablessh VNC
+        # injection needs a VGA console -- so this machine type describes
+        # only the published RUNTIME shape anyvm.py launches. The kernel
+        # anyvm boots is a separate release asset (kernel_asset below),
+        # published by the builder's release-files job, NOT by build.py.
+        # Boot-to-ssh measured 4x faster than pc/GENERIC on netbsd 11.0
+        # (7.4s vs 29.6s under KVM, 2026-08-31).
+        return "microvm", "rtc=on,acpi=off,pic=off"
     return "pc", "hpet=off,smm=off,graphics=on,vmport=off,usb=on"
 
 
@@ -1536,6 +1547,10 @@ def _profile_rng():
     arch = env("VM_ARCH") or "x86_64"
     if arch == "s390x":
         return "ccw"
+    if env("VM_MICROVM"):
+        # microvm has no PCI bus; the rng rides the MMIO virtio transport
+        # (virtio-rng-device). Verified attaching as viornd0 on netbsd 11.0.
+        return "mmio"
     if (env("VM_OS_NAME") in ("solaris", "reactos")
             or arch in ("sparc64", "armv7")):
         # armv7 is raspi2b, which has no PCI bus at all -- QEMU aborts at
@@ -1581,6 +1596,10 @@ def _profile_balloon():
     except NetBSD (its GENERIC64 cannot drive the PCI balloon); never on aarch64
     / s390x / sparc64 / pseries."""
     arch = env("VM_ARCH") or "x86_64"
+    if env("VM_MICROVM"):
+        # No PCI bus on microvm, so no virtio-balloon-pci (and no MMIO
+        # balloon is attached either -- keep the device set minimal).
+        return False
     if env("VM_OS_NAME") == "reactos":
         # No virtio-balloon driver; an unclaimed PCI device raises a modal
         # New Hardware Wizard over the desktop.
@@ -1605,9 +1624,26 @@ def build_guest_profile():
     mtype, mopts = _profile_machine()
     # NetBSD/riscv64 GENERIC64 has no PCI virtio bus, so build_qemu_args() drives
     # virtio over the MMIO transport there (virtio-blk-device / virtio-net-device).
-    mmio = (osname == "netbsd" and arch == "riscv64")
+    # The microvm machine has no PCI bus at all, so its runtime shape is MMIO
+    # too (the BUILD still runs on pc -- see _profile_machine()).
+    mmio = (osname == "netbsd" and arch == "riscv64") or bool(env("VM_MICROVM"))
     nic = net_card()
-    if mmio and nic.startswith("virtio-net-pci"):
+    if env("VM_MICROVM"):
+        # The microvm machine has NO PCI bus, so the runtime NIC is always the
+        # MMIO virtio device -- INDEPENDENT of whatever the build ran on. The
+        # build uses the pc machine and whatever net_card() picks there (e1000
+        # for netbsd/x86_64), and that is deliberately left alone: deriving the
+        # profile's NIC from the build's would force a microvm conf to set
+        # VM_NIC=virtio purely to steer this field, which makes the variant's
+        # BUILD differ from the plain release's for no runtime reason. It does
+        # not need to match: these guests configure the network by interface
+        # discovery (netbsd runs a global dhcpcd), so an image installed with
+        # wm0 brings up vioif0 at run time -- verified by booting the plain
+        # e1000-built 11.0 image under microvm and watching vioif0 take a
+        # lease. Keeps netbsd's ctrl_vq=off decoration (the vioif control-queue
+        # wedge applies to the MMIO transport too).
+        nic = netbsd_ctrl_vq_off("virtio-net-device")
+    elif mmio and nic.startswith("virtio-net-pci"):
         # startswith, NOT ==: net_card() returns the model WITH option
         # flags ("virtio-net-pci,ctrl_vq=off" on netbsd), so an exact
         # match silently skipped the translation and the profile shipped
@@ -1628,6 +1664,8 @@ def build_guest_profile():
     elif arch == "aarch64":
         v = vga_type()
         vga = "virtio-gpu-pci" if v in ("virtio", "virtio-gpu", "std", "") else v
+    elif env("VM_MICROVM"):
+        vga = None             # microvm has no PCI/ISA VGA; console is serial
     else:
         vga = vga_type()       # x86: std / cirrus / virtio
     # Hard guest limits. sun4u (sparc64) is uniprocessor and its early
@@ -1643,7 +1681,7 @@ def build_guest_profile():
         cpu_cap = 1
         if arch == "i386":
             mem_cap = 2048
-    return {
+    profile = {
         "anyvm_profile_version": GUEST_PROFILE_VERSION,
         "os": osname,
         "arch": arch,
@@ -1673,6 +1711,27 @@ def build_guest_profile():
         "mem_cap_mb": mem_cap,
         "cpu_cap": cpu_cap,
     }
+    if env("VM_MICROVM"):
+        # microvm boots by direct kernel load (-kernel), not a bootloader.
+        # The kernel is a SEPARATE release asset published by this builder's
+        # release-files job (uploadfiles.yml), named like the image sidecars
+        # so anyvm.py fetches it from the same pinned release. The append
+        # line is conf-owned (VM_MICROVM_APPEND): the root device is a
+        # per-image fact (GPT wedge dk0 on netbsd, NOT the wiki's ld0a).
+        append = env("VM_MICROVM_APPEND")
+        if not append:
+            # A microvm profile without an append line ships a broken
+            # runtime shape; fail the profile write loudly (exportOVA logs
+            # the exception; anyvm then falls back to the plain pc boot,
+            # which this image also supports -- degraded, not broken).
+            raise ValueError("VM_MICROVM is set but VM_MICROVM_APPEND is "
+                             "empty; the conf must provide the kernel "
+                             "append line (e.g. root=dk0 console=com rw)")
+        suffix = "" if arch == "x86_64" else "-" + arch
+        profile["kernel_asset"] = "%s-%s%s-kernel" % (
+            osname, env("VM_RELEASE"), suffix)
+        profile["kernel_append"] = append
+    return profile
 
 
 def _profile_sanity_check(profile, cmdline_path):
@@ -1680,6 +1739,12 @@ def _profile_sanity_check(profile, cmdline_path):
     value is absent from the QEMU command line build_qemu_args() actually
     launched. Catches build_guest_profile() falling out of step with
     build_qemu_args() at CI time, where it is cheap to notice."""
+    if env("VM_MICROVM"):
+        # The profile deliberately describes a RUNTIME shape (microvm, MMIO
+        # virtio, direct kernel boot) that differs from the pc machine the
+        # build itself ran on, so every check below would cry drift. The
+        # runtime shape is verified end to end by anyvm's testrun instead.
+        return
     try:
         with open(cmdline_path) as f:
             cl = f.read()
