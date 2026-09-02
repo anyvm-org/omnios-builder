@@ -2283,8 +2283,23 @@ def createVM(isolink=None, sshport=None, disklink=None):
     if not osname: return 1
     vdi = wf("%s.qcow2" % osname)
     iso = wf("%s.iso" % osname)
-    if isolink.endswith("img"):
-        iso = wf("%s.img" % osname)
+    prebuilt = wf("%s.img" % osname)
+    if os.path.exists(prebuilt):
+        # A beforeBuild hook CONSTRUCTED the boot medium on the host rather
+        # than naming one to download -- alpine-builder does this for
+        # riscv64, where upstream ships no bootable image at all, only a
+        # tarball of kernel + initramfs + extlinux.conf + u-boot that has to
+        # be assembled into a disk first. Take it as the medium, and note
+        # that the download below is then skipped because the file is
+        # already there. Checking for the file rather than reading the URL
+        # suffix means such a builder does not have to invent a URL that
+        # ends in "img" for a medium it never downloads. Existing builders
+        # are unaffected: this path only triggers when <os>.img is present
+        # before createVM runs, and clearVM() (which now runs ahead of
+        # beforeBuild) has just removed any left over from a previous run.
+        iso = prebuilt
+    elif isolink.endswith("img"):
+        iso = prebuilt
     if not os.path.exists(iso):
         download(isolink, iso)
         if isolink.endswith("bz2"):
@@ -4171,10 +4186,34 @@ def main(argv):
     os.environ["VM_WORKDIR"] = WORKDIR
     os.environ["VM_WORK_QCOW"] = wf("%s.qcow2" % osname)
 
+    # Clean slate FIRST: kill a VM left running by a previous run, close its
+    # console, and remove that run's disk (<os>.qcow2 / <os>.img) and state
+    # files (pid, ports, serial/qemu logs, cmdline, EFI vars) plus
+    # known_hosts. On a CI runner the workspace is fresh so this is nearly a
+    # no-op; locally it is what makes two consecutive build.py runs in the
+    # same tree work, instead of silently reusing a half-built disk or
+    # tripping over stale port files and a stale host key.
+    #
+    # This runs BEFORE beforeBuild, not after, so that a hook which
+    # CONSTRUCTS a boot medium on the host still has it by the time
+    # createVM() looks: clearVM deletes exactly <os>.qcow2 and <os>.img, and
+    # running it afterwards would throw such a medium away with no hook point
+    # left in between. Verified safe across the fleet when this moved: no
+    # beforeBuild hook produces either of those two names (alpine writes
+    # alpine-live.img, riscos writes riscos.imgzip, hardenedbsd writes
+    # efiboot.img inside an ISO tree), and none of them starts or depends on
+    # a running VM -- so for every existing builder the order is
+    # indistinguishable, while a constructing hook now has somewhere to put
+    # its output.
+    if clearVM() != 0:
+        log("vm does not exist (ok)")
+
     # Earliest hook point: runs before setup() (which, among other things,
     # extracts VM_QEMU_TAR), so a builder can generate build inputs on the
     # fly -- e.g. ubuntu-builder's hooks/host_beforeBuild.sh compiles its
-    # pinned QEMU tarball here instead of committing 30MB binaries to git.
+    # pinned QEMU tarball here instead of committing 30MB binaries to git,
+    # and alpine-builder's builds the riscv64 live disk that createVM() then
+    # boots directly.
     run_hook("beforeBuild")
 
     startWeb("needOCR")
@@ -4183,9 +4222,6 @@ def main(argv):
     log("============== host CPU ==============")
     sh("lscpu || cat /proc/cpuinfo || true")
     log("=====================================")
-
-    if clearVM() != 0:
-        log("vm does not exist (ok)")
 
     if env("VM_ISO_LINK"):
         if createVM(env("VM_ISO_LINK"), sshport, env("VM_PRE_DISK_LINK")) != 0:
