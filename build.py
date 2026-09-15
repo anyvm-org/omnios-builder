@@ -1303,8 +1303,15 @@ def build_qemu_args(media_kind=None, media_path=None):
             pc_mopts = ("%s,accel=%s,smm=off,graphics=on,vmport=off,usb=on"
                         % (hurd_mtype, accel))
         a += ["-machine", pc_mopts]
-        # Mirrors anyvm.py:5413-5439.
-        if accel == "kvm":
+        # Mirrors anyvm.py:5413-5439. A per-conf VM_CPU_MODEL pin wins over
+        # the host-aware pick below, so an old kernel can avoid host CPU
+        # features it predates (freebsd-builder pins qemu64 for 10.4, whose
+        # signal delivery panics on the full modern XSAVE set under -cpu
+        # host). The pin is also what _profile_cpu_model() records; anyvm.py
+        # does NOT read it back and keeps its own hand-mirrored branches.
+        if env("VM_CPU_MODEL"):
+            cpu = env("VM_CPU_MODEL")
+        elif accel == "kvm":
             if osname == "dragonflybsd":
                 # DragonFlyBSD's early-boot init writes to MSRs that vary by
                 # runner CPU generation. -cpu host exposes too much; even
