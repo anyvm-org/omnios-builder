@@ -54,7 +54,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ["r151046", "r151048", "r151050", "r151052", "r151054", "r151054-build", "r151056", "r151056-build", "r151058", "r151058-build"]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
 #    - name: Free Disk Space (Ubuntu)
 #      uses: jlumbroso/free-disk-space@main
@@ -63,6 +63,15 @@ jobs:
 #        # if set to "true" but frees about 6 GB
 #        tool-cache: false
     - uses: actions/checkout@v7
+    # A builder whose confs install paddlepaddle (VM_OCR=paddle: omnios)
+    # sets BUILD_PYTHON in .github/data/datafile.ini: paddlepaddle has no
+    # cp314 wheel (3.3.1 stops at cp313) and ubuntu-26.04's python3 is
+    # 3.14. Everywhere else BUILD_PYTHON is unset, this step is skipped and
+    # build.py runs on the runner's own python3.
+    - uses: actions/setup-python@v7
+      if: ${{ '3.13' != '' }}
+      with:
+        python-version: '3.13'
     - name: Creating Web console
       uses: anyvm-org/cf-tunnel@v0
       id: tunnel
@@ -132,7 +141,7 @@ jobs:
     # Gate on the event, not github.ref: a 'release' event's github.ref can be
     # refs/heads/<branch>, which silently skips the upload. event_name is stable.
     if: "github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')"
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@v7
     - name: Upload release index Asset

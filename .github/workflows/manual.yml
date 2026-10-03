@@ -5,12 +5,17 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       DEBUG: 1
       NGROK_TOKEN : ${{ secrets.NGROK_TOKEN }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
+    # Same Python as build.yml's build job (see the note there).
+    - uses: actions/setup-python@v7
+      if: ${{ '3.13' != '' }}
+      with:
+        python-version: '3.13'
     - name: Creating web console
       uses: anyvm-org/cf-tunnel@v0
       id: tunnel

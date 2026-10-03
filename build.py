@@ -20,6 +20,7 @@ Usage: python3 build.py conf/<name>.conf
 
 import base64
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -432,6 +433,25 @@ def resolve_qemu_bin():
     return shutil.which(n) or n
 
 
+_qemu_versions = {}
+
+
+def qemu_version(qemu_bin):
+    """(major, minor) of a QEMU binary, read from `--version`, or None."""
+    if qemu_bin not in _qemu_versions:
+        ver = None
+        try:
+            out = subprocess.run([qemu_bin, "--version"], capture_output=True,
+                                 text=True, timeout=30).stdout
+            m = re.search(r"version (\d+)\.(\d+)", out)
+            if m:
+                ver = (int(m.group(1)), int(m.group(2)))
+        except Exception:
+            pass
+        _qemu_versions[qemu_bin] = ver
+    return _qemu_versions[qemu_bin]
+
+
 def hvf_supported():
     if not is_darwin():
         return False
@@ -681,6 +701,40 @@ def obsd_acpi_off():
     return env("VM_OS_NAME") == "openbsd" and env("VM_ARCH") == "aarch64"
 
 
+def netbsd9_acpi_off():
+    """NetBSD 9.x aarch64 boots with acpi=off, from the device tree. Through
+    ACPI it hangs on QEMU 10.2.1 (the ubuntu-26.04 runners' build) right
+    after its interrupt controller attaches -- the same with its=off, with
+    gic-version=2 and with the virt-8.2 / virt-9.2 machine types -- while
+    8.2.2 boots it either way, so there is no QEMU version gate. NetBSD
+    10.x and 11.0 are not affected. Mirrors anyvm.py's netbsd 9.x rule, so
+    the image is built the way anyvm.py launches it."""
+    return (env("VM_OS_NAME") == "netbsd" and env("VM_ARCH") == "aarch64"
+            and env("VM_RELEASE").split(".")[0] == "9")
+
+
+def freebsd_riscv64_sstc_off():
+    """FreeBSD 13.2 - 14.3 riscv64 need the Sstc extension off on QEMU 10.1
+    and later. On 10.2.1 (the ubuntu-26.04 runners' build) they hang right
+    after the last PCI device attaches, before "Timecounters tick", with
+    OpenSBI 1.3, 1.7 or 1.8.1 alike; with sstc=off they boot to login.
+    14.4, 14.5 and 15.x boot with Sstc, and 8.2.2 boots all of them. 10.1 is
+    where QEMU reworked the Sstc timer (dff5f51540 and its series). Without
+    Sstc the kernel sets its timer through SBI, as on hardware that lacks
+    the extension. Mirrors anyvm.py's freebsd rule (same release bound, same
+    QEMU gate). The guest profile keeps plain rv64: the gate is a property
+    of the host's QEMU, not of the guest."""
+    if env("VM_OS_NAME") != "freebsd" or env("VM_ARCH") != "riscv64":
+        return False
+    try:
+        rel = tuple(int(x) for x in env("VM_RELEASE").split(".")[:2])
+    except ValueError:
+        return False
+    if len(rel) < 2 or rel >= (14, 4):
+        return False
+    return (qemu_version(resolve_qemu_bin()) or (0, 0)) >= (10, 1)
+
+
 def make_blank(path, mb):
     # Write real zero bytes (NOT f.truncate(), which makes a sparse file).
     # Mirrors anyvm.py:create_sized_file. The aarch64 virt machine treats the
@@ -835,6 +889,93 @@ def _find_aarch64_efi_vars(code_src, qemu_bin=None):
     return ""
 
 
+# edk2 builds from edk2-stable202508 (where the LPA2 code landed) through
+# 202604 hang under QEMU -cpu max right after the firmware banner
+# (tianocore/edk2#11962), and Ubuntu 26.04's qemu-efi-aarch64 is a 2025.11
+# build, so on an ubuntu-26.04 runner every aarch64 build on -cpu max would
+# stop there. When the CODE image found above carries such a build stamp, the
+# build boots the one an ubuntu-24.04 runner finds there instead:
+# /usr/share/AAVMF/AAVMF_CODE.no-secboot.fd (what AAVMF/AAVMF_CODE.fd links
+# to) from qemu-efi-aarch64 2024.02-2ubuntu0.9. The VARS template stays the
+# host's AAVMF_VARS.fd, which is byte-identical in the 2024.02 and 2025.11
+# packages, so the aarch64 builds keep the exact CODE/VARS pair they had on
+# 24.04.
+#
+# anyvm.py swaps by the same build-stamp rule but boots that package's
+# QEMU_EFI.fd: a different build of the same release, and the one this file
+# stopped preferring because OpenBSD's bsd.rd resets in a loop on it (see
+# _AARCH64_EFI_CODE_RELNAMES). anyvm-org/firmware publishes both; its fetch.sh
+# copies each out of the Ubuntu package with the package and the image
+# sha256-pinned, and the image is pinned again here, so a build only ever
+# boots these bytes.
+FIRMWARE_VERSION = "0.0.3"
+PINNED_AARCH64_CODE_ASSET = "AAVMF_CODE.no-secboot-2024.02-2ubuntu0.9.fd"
+PINNED_AARCH64_CODE_URL = ("https://github.com/anyvm-org/firmware/releases/download/"
+                           "v%s/%s" % (FIRMWARE_VERSION, PINNED_AARCH64_CODE_ASSET))
+PINNED_AARCH64_CODE_SHA256 = "4a4cb7f6d8106bb2a7dd8c763fab14b1810152136fc4304e5b728f0043e84f12"
+# YYYYMM build stamp of the first edk2 stable release with the LPA2 code.
+FIRST_BAD_AARCH64_FIRMWARE_BUILD = 202508
+
+# The edk2 version string (PcdFirmwareVersionString, e.g. "2025.11-3ubuntu7.2")
+# is stored as UTF-16LE. Mirrors anyvm.py's _AARCH64_FW_BUILD_RE.
+_AARCH64_FW_BUILD_RE = re.compile(
+    br"(2\x000\x00[2-9]\x00[0-9]\x00)(?:\.\x00)?(0\x00[1-9]\x00|1\x00[0-2]\x00)")
+
+
+def _aarch64_firmware_build(path):
+    """YYYYMM edk2 build stamp of an aarch64 UEFI CODE image, or None when
+    there is none to find (the image is then used as found). Only the first
+    8 MiB are read: the stamp sits in the leading volume, and a 64 MiB
+    AAVMF_CODE.fd is mostly padding. Mirrors anyvm.py:aarch64_firmware_build."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(8 << 20)
+    except (IOError, OSError):
+        return None
+    m = _AARCH64_FW_BUILD_RE.search(data)
+    if not m:
+        return None
+    return int((m.group(1) + m.group(2)).replace(b"\x00", b""))
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _aarch64_code_for_build(code_src):
+    """The CODE image to boot: code_src, or the pinned 2024.02 image when
+    code_src is an edk2 build from FIRST_BAD_AARCH64_FIRMWARE_BUILD on. A
+    VM_EFI_CODE override is used as given. The pinned image is downloaded
+    into WORKDIR on first use and its sha256 checked on every use; when it
+    cannot be had the build stops here, since booting the host image instead
+    would only trade this error for a boot timeout."""
+    if not code_src or (env("VM_EFI_CODE") and code_src == env("VM_EFI_CODE")):
+        return code_src
+    build = _aarch64_firmware_build(code_src)
+    if build is None or build < FIRST_BAD_AARCH64_FIRMWARE_BUILD:
+        return code_src
+    pinned = wf(PINNED_AARCH64_CODE_ASSET)
+    if not (os.path.isfile(pinned)
+            and _sha256_file(pinned) == PINNED_AARCH64_CODE_SHA256):
+        part = pinned + ".part"
+        download(PINNED_AARCH64_CODE_URL, part)   # exits the build on failure
+        actual = _sha256_file(part)
+        if actual != PINNED_AARCH64_CODE_SHA256:
+            log("FATAL: %s has sha256 %s, expected %s" % (
+                PINNED_AARCH64_CODE_URL, actual, PINNED_AARCH64_CODE_SHA256))
+            sys.exit(1)
+        os.replace(part, pinned)
+    log("aarch64 UEFI CODE: %s is an edk2 %d.%02d build (builds from 2025.08 on "
+        "hang -cpu max at the banner); booting %s, the ubuntu-24.04 image, "
+        "instead" % (code_src, build // 100, build % 100,
+                     PINNED_AARCH64_CODE_ASSET))
+    return pinned
+
+
 # Legacy alias kept for any in-tree references.
 AARCH64_EFI_CANDIDATES = []
 
@@ -953,6 +1094,7 @@ def build_qemu_args(media_kind=None, media_path=None):
         varsf = wf("%s-QEMU_EFI_VARS.fd" % osname)
         code_src = _find_aarch64_efi_code(resolve_qemu_bin())
         if not os.path.exists(efi):
+            code_src = _aarch64_code_for_build(code_src)
             if not code_src:
                 log("aarch64 UEFI CODE firmware not found "
                     "(install edk2-aarch64 / qemu-efi-aarch64)")
@@ -972,7 +1114,7 @@ def build_qemu_args(media_kind=None, media_path=None):
                 log("aarch64 UEFI VARS template not found; using blank store "
                     "(this can cause guest reboot loops on NetBSD evbarm)")
         mopts = "virt,accel=%s,gic-version=3,usb=on" % accel
-        if obsd_acpi_off(): mopts += ",acpi=off"
+        if obsd_acpi_off() or netbsd9_acpi_off(): mopts += ",acpi=off"
         if accel in ("kvm", "hvf"): cpu = "host"
         elif env("VM_OS_NAME") == "openbsd": cpu = "neoverse-n1"
         else: cpu = "max"
@@ -1020,6 +1162,8 @@ def build_qemu_args(media_kind=None, media_path=None):
         # boot 26.04's kernel 7.0 at all -- it hangs at entry with zero
         # output).
         rcpu = env("VM_CPU_MODEL") or "rv64"
+        if not env("VM_CPU_MODEL") and freebsd_riscv64_sstc_off():
+            rcpu = "rv64,sstc=off"
         a += ["-machine", "virt,accel=tcg,usb=on,acpi=off", "-cpu", rcpu]
         # NetBSD/riscv GENERIC64 drives virtio over MMIO, not PCI: virtio-blk-pci
         # enumerates "not configured" so the kernel can't find root ("boot
@@ -1480,7 +1624,7 @@ def _profile_machine():
     osname = env("VM_OS_NAME")
     if arch == "aarch64":
         opts = "gic-version=3,usb=on"
-        if obsd_acpi_off():
+        if obsd_acpi_off() or netbsd9_acpi_off():
             opts += ",acpi=off"
         return "virt", opts
     if arch == "riscv64":
@@ -1624,8 +1768,8 @@ def build_guest_profile():
     """Normalized, host-independent description of the guest's QEMU hardware
     shape (see the section comment above). Reuses the same helpers
     build_qemu_args() calls -- net_card(), disk_if(), vga_type(),
-    obsd_acpi_off() -- so disk/NIC/VGA/ACPI carry ZERO drift; the rest mirrors
-    build_qemu_args()'s per-arch blocks."""
+    obsd_acpi_off(), netbsd9_acpi_off() -- so disk/NIC/VGA/ACPI carry ZERO
+    drift; the rest mirrors build_qemu_args()'s per-arch blocks."""
     arch = env("VM_ARCH") or "x86_64"
     osname = env("VM_OS_NAME")
     mtype, mopts = _profile_machine()
@@ -2192,8 +2336,17 @@ def setup(install_ocr=None):
             if os.path.exists(vp):
                 _run_quiet(["sudo", "ln", "-sf", vp, "/usr/local/bin/vncdotool"])
         if env("VM_ARCH") == "riscv64":
+            # qemu-system-riscv64 ships in qemu-system-misc up to Ubuntu 24.04
+            # and in its own qemu-system-riscv package from Ubuntu 25.10 /
+            # Debian 13 on, where misc no longer carries it (and the virtual
+            # name qemu-system-riscv64 has two providers there, so apt
+            # refuses it). Ask apt which one exists.
+            rv_pkg = ("qemu-system-riscv"
+                      if subprocess.run(["apt-cache", "show", "qemu-system-riscv"],
+                                        stdout=DEVNULL, stderr=DEVNULL).returncode == 0
+                      else "qemu-system-misc")
             _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
-                        "qemu-system-misc", "u-boot-qemu"], env=apt_env)
+                        rv_pkg, "u-boot-qemu"], env=apt_env)
         if env("VM_ARCH") == "loongarch64":
             # qemu-system-loongarch64 ships in qemu-system-misc on Ubuntu.
             # Installing it also pulls the runtime libs the pinned
