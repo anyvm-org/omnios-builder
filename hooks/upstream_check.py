@@ -22,6 +22,19 @@
 # followed by the closing slash, counts -- this also excludes bloody/braich
 # which are named without the r151NNN shape.
 #
+# A directory is NOT a release. Observed 2026-10-03..05: upstream created
+# media/r151060/ EMPTY (just the "../" link) weeks before the release,
+# while omnios.org/download still named r151058 as the current stable.
+# Reporting r151060 then made watch.py derive
+# media/r151060/omnios-r151060.iso, whose HEAD 404'd, and the whole run
+# went red every night (issue #4) although nothing was wrong. So a
+# version is reported only when its directory listing carries the
+# omnios-<version>.iso the confs point at; an empty or ISO-less
+# directory is skipped and the newest populated one is reported instead.
+# A populated directory looks like
+#   <td class="name"><a href="omnios-r151058.iso" ...>omnios-r151058.iso</a></td>
+# next to .usb-dd, .zfs.xz, .cloud.* siblings (checked 2026-10-05).
+#
 # stdlib only (urllib.request, re, sys, os) -- no external dependencies.
 
 import os
@@ -78,6 +91,17 @@ def fetch(url):
         return resp.read().decode("utf-8", "replace")
 
 
+def has_iso(listing, version):
+    """True when the directory listing links the installer ISO.
+
+    The confs' VM_ISO_LINK is media/<version>/omnios-<version>.iso, so
+    that exact filename is the one that decides "released". Anchored on
+    the href so a stray mention elsewhere on the page cannot match.
+    """
+    return re.search(r'href="omnios-%s\.iso"' % re.escape(version),
+                     listing) is not None
+
+
 def main():
     try:
         key = resolve_natural_key()
@@ -95,9 +119,31 @@ def main():
         sys.stderr.write("upstream_check: no rNNNNNN directory found in "
                          "%s; page shape may have changed\n" % URL)
         return 1
-    newest = sorted(set(versions), key=key)[-1]
-    print(newest)
-    return 0
+    # Newest first; stop at the first directory that really holds the ISO.
+    # Normally that is the very first one (one extra fetch); a pre-created
+    # empty directory costs one more and is reported on stderr so the run
+    # log says why the newer name was passed over.
+    skipped = []
+    for version in sorted(set(versions), key=key, reverse=True):
+        dir_url = URL + version + "/"
+        try:
+            listing = fetch(dir_url)
+        except Exception as e:
+            sys.stderr.write("upstream_check: fetch of %s failed: %s\n"
+                             % (dir_url, e))
+            return 1
+        if has_iso(listing, version):
+            for empty in skipped:
+                sys.stderr.write("upstream_check: %s%s/ exists but has no "
+                                 "omnios-%s.iso yet; not released\n"
+                                 % (URL, empty, empty))
+            print(version)
+            return 0
+        skipped.append(version)
+    sys.stderr.write("upstream_check: none of %s carries an omnios-<ver>.iso "
+                     "under %s; page shape may have changed\n"
+                     % (", ".join(sorted(set(versions), key=key)), URL))
+    return 1
 
 
 if __name__ == "__main__":
