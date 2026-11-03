@@ -1990,9 +1990,22 @@ def _download_chunk(url, fpath, start, end):
         try:
             written = 0
             with _http_get_stream(url, start, end) as resp, open(fpath, "r+b") as f:
+                # A server that ignores Range answers 200 with the WHOLE file.
+                # Written at `start` it runs past the chunk, and the clean
+                # retry cannot shrink the file back: openindiana 202510 via
+                # Cloudflare ended at 929996550 + 4 chunks = 1394994826 bytes.
+                # Refuse the body unread and retry; never write past the chunk.
+                # A 206 for some OTHER range is refused too: with the capped
+                # read below it would land at `start` with the right length
+                # and the wrong bytes.
+                cr = resp.headers.get("Content-Range") or ""
+                if resp.getcode() != 206 or not cr.startswith(
+                        "bytes %d-%d/" % (start, end)):
+                    raise IOError("range [%d-%d] not honoured: HTTP %d %s" % (
+                        start, end, resp.getcode(), cr or "(no Content-Range)"))
                 f.seek(start)
-                while True:
-                    buf = resp.read(DL_BUF)
+                while written < expected:
+                    buf = resp.read(min(DL_BUF, expected - written))
                     if not buf: break
                     f.write(buf)
                     written += len(buf)
@@ -2030,10 +2043,26 @@ def _download_resume(url, fpath, total):
     open(fpath, "wb").close()   # start from an empty file
     got = 0
     stalls = 0
+    restarts = 0
     while got < total:
         start = got
         try:
             with _http_get_stream(url, got, None) as resp, open(fpath, "r+b") as f:
+                cr = resp.headers.get("Content-Range") or ""
+                if resp.getcode() == 206 and not cr.startswith("bytes %d-" % got):
+                    raise IOError("resume at %d answered with %s" % (
+                        got, cr or "no Content-Range"))
+                if got and resp.getcode() != 206:
+                    # Range ignored: this body starts at byte 0, not at
+                    # `got`. Appending it would corrupt the image silently,
+                    # so start over from this same response (bounded).
+                    restarts += 1
+                    if restarts > DL_ATTEMPTS:
+                        raise IOError("range ignored %d times" % restarts)
+                    log("download: range ignored at %d/%d (HTTP %d), "
+                        "restarting from 0" % (got, total, resp.getcode()))
+                    f.truncate(0)
+                    got = start = 0
                 f.seek(got)
                 while True:
                     buf = resp.read(DL_BUF)
