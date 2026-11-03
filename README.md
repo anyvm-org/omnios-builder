@@ -14,6 +14,8 @@ All the supported releases are here:
 
 | Release | Comments | LTS | End-of-Life | x86_64 |
 |---------|---------|---------|---------|---------|
+| r151060-build | — | — | — | ✅ (rsync,scp,nfs,tar) |
+| r151060 | — | — | — | ✅ (rsync,scp,nfs,tar) |
 | r151058-build | build-essential | — | 2027-05-03 | ✅ (rsync,scp,nfs,tar) |
 | r151058 | — | — | 2027-05-03 | ✅ (rsync,scp,nfs,tar) |
 | r151056-build | build-essential | — | 2026-11-02 | ✅ (rsync,scp,nfs,tar) |
@@ -74,6 +76,6 @@ How to build:
 
     Just clone the repo. and run:
     ```bash
-    python3 build.py conf/omnios-r151058.conf
+    python3 build.py conf/omnios-r151060.conf
     ```
    
