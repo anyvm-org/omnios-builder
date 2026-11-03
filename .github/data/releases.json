@@ -90,6 +90,24 @@
       "shutdown": "shutdown -y -i5 -g0",
       "desktop": false,
       "build": true
+    },
+    {
+      "tag": "r151060",
+      "release": "r151060",
+      "arch": "x86_64",
+      "sync": "rsync,scp,nfs,tar",
+      "shutdown": "shutdown -y -i5 -g0",
+      "desktop": false,
+      "build": true
+    },
+    {
+      "tag": "r151060-build",
+      "release": "r151060-build",
+      "arch": "x86_64",
+      "sync": "rsync,scp,nfs,tar",
+      "shutdown": "shutdown -y -i5 -g0",
+      "desktop": false,
+      "build": true
     }
   ]
 }
