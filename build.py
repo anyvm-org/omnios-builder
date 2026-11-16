@@ -2782,8 +2782,9 @@ def ocr_paddle(img):
     PP-OCRv6 tiers have a systematic g->q misread on the OmniOS console font
     (login->loqin, Configure->Confiqure, Copyright->Copyriqht) that breaks
     waitForText matching; medium reads them cleanly at the cost of a heavier
-    predict. The engine is built once and reused. enable_mkldnn=False avoids a
-    paddlepaddle 3.x oneDNN/PIR crash; the doc-orientation / unwarp /
+    predict -- on most runners, which is why _screen_has() still folds q to g
+    for this engine. The engine is built once and reused. enable_mkldnn=False
+    avoids a paddlepaddle 3.x oneDNN/PIR crash; the doc-orientation / unwarp /
     textline-orientation sub-models are disabled (a flat console screen needs
     none). Falls back to tesseract on any error / if PaddleOCR is not
     installed."""
@@ -2948,18 +2949,48 @@ def _unseen_screen_text(screen):
             return ""
         posmap[path] = pos + len(data)
         return data.decode("utf-8", "replace")
-    seen = _screen_dump_state["ocr_seen"]
+    return _fresh_lines(screen, _screen_dump_state["ocr_seen"])
+
+
+def _fresh_lines(screen, seen):
+    """The lines of `screen` whose key is not in the set `seen` yet (they are
+    added to it). The key collapses whitespace runs: OCR renders the same
+    physical line with jittering whitespace from capture to capture, which
+    would make old lines look new forever. Lines keep their original form."""
     fresh_lines = []
     for ln in screen.splitlines():
-        # Normalize the dedup key: OCR renders the same physical line with
-        # jittering whitespace from capture to capture, which would make old
-        # lines look new forever. Collapse whitespace runs for the key; the
-        # line itself is printed in its original form.
         key = " ".join(ln.split())
         if key and key not in seen:
             seen.add(key)
             fresh_lines.append(ln)
     return "\n".join(fresh_lines)
+
+
+def _web_screen_since(t0):
+    """The screen text startWeb's capture loop last wrote to screen.txt, or ""
+    when it has written none since t0: the file a previous VM left behind is
+    not this boot's screen."""
+    try:
+        if os.path.getmtime("screen.txt") < t0:
+            return ""
+        with open("screen.txt") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _screen_has(text, screen):
+    """True when `text` is on the captured `screen`. With VM_OCR=paddle a g
+    that PaddleOCR read as q still matches: the medium PP-OCRv6 tier reads
+    the OmniOS console font cleanly on most runners, not all. omnios-builder
+    lost five jobs (2026-10-03 .. 11-03, all on AMD EPYC 9V45 runners) to a
+    guest sitting at its login prompt while the screen read
+    "omnios console loqin:", so the VM_LOGIN_TAG wait timed out twice."""
+    if text in screen:
+        return True
+    if env("VM_OCR") == "paddle":
+        return text.replace("q", "g") in screen.replace("q", "g")
+    return False
 
 
 def waitForText(text=None, sec="", hook=None):
@@ -3017,7 +3048,7 @@ def waitForText(text=None, sec="", hook=None):
             log(fresh); log("==========screen Text end============")
         else:
             log("(no new screen text)")
-        if text in screen:
+        if _screen_has(text, screen):
             log("====> OK, found: %s" % text); return 0
         elif env("DEBUG"):
             log("Not found for text: %s" % text)
@@ -4015,7 +4046,7 @@ def start_and_wait():
             time.sleep(3)
             return 0
         waitForText(env("VM_LOGIN_TAG"), str(lmax))
-        if env("VM_LOGIN_TAG") in _screen_text_value(None):
+        if _screen_has(env("VM_LOGIN_TAG"), _screen_text_value(None)):
             time.sleep(3)
             return 0
         log("start_and_wait: no login prompt within %d s (attempt %d/%d); "
@@ -4776,8 +4807,11 @@ def main(argv):
                 return 1
             vstart = time.time()
             vdeadline = vstart + vmax
+            vscreen = ""
+            vseen = set()
+            verr = ""
             while time.time() < vdeadline:
-                ok, _err = _ssh_ready_check()
+                ok, verr = _ssh_ready_check()
                 if ok:
                     verify_ready = True
                     break
@@ -4790,12 +4824,29 @@ def main(argv):
                 vmm, vss = divmod(int(time.time() - vstart), 60)
                 log("[%dm%02ds] verify boot %d/2, serial=%dB | %s"
                     % (vmm, vss, vattempt, vsize, vtail[:140]))
+                # A guest whose console is the VGA screen leaves the serial
+                # tail empty (omnios: serial=4B through 24 failed verify
+                # boots on EPYC 7763 runners, 2026-10-03 .. 11-03, so where
+                # they stuck is unknown), so also show what startWeb's
+                # capture loop read off the screen: new lines only, so a
+                # screen that sits still prints once.
+                if not env("VM_USE_CONSOLE_BUILD"):
+                    vscreen = _web_screen_since(vstart) or vscreen
+                    fresh = _fresh_lines(vscreen, vseen)
+                    if fresh:
+                        log("verify boot %d/2 screen:\n%s" % (vattempt, fresh))
                 time.sleep(5)
             if verify_ready:
                 break
             log("verification VM not ssh-reachable within %d s "
                 "(attempt %d/2); force-killing for a fresh boot"
                 % (vmax, vattempt))
+            if vscreen.strip():
+                log("last screen of verify boot %d/2:\n%s"
+                    % (vattempt, vscreen.strip()))
+            log("last ssh probe: %s" % (_ssh_verbose_summary(verr)
+                                        or "no answer within the probe "
+                                           "timeout"))
             destroyVM()
         if not verify_ready:
             log("verification VM never became ssh-reachable; aborting")
