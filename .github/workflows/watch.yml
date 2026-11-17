@@ -25,6 +25,7 @@ concurrency:
 
 jobs:
   watch:
+    if: github.event_name != 'schedule' || github.repository == 'anyvm-org/omnios-builder'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
