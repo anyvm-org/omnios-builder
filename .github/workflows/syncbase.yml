@@ -23,7 +23,7 @@ jobs:
       - name: Using main branch
         run: |
           git switch main || (git fetch --all && git checkout -b main origin/main)
-          git clone https://github.com/anyvm-org/base-builder.git
+          git clone https://github.com/${{ github.repository_owner }}/base-builder.git
 
       - name: Sync generate.yml
         uses: anyvm-org/template-render@v0.0.4
