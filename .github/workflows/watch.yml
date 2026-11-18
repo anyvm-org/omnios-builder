@@ -34,7 +34,7 @@ jobs:
       - name: Detect and land a new upstream release
         run: |
           git switch main || (git fetch --all && git checkout -b main origin/main)
-          git clone https://github.com/anyvm-org/base-builder.git
+          git clone https://github.com/${{ github.repository_owner }}/base-builder.git
           # anyvm holds coverage.allow. Without it watch.py cannot tell
           # which variants are deliberately untested, and its suggested
           # allow lines would silently always be empty. Cloned OUTSIDE the
