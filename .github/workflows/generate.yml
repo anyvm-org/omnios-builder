@@ -25,7 +25,7 @@ jobs:
       - name: Preparing env variables
         run: |
           git switch main || (git fetch --all && git checkout -b main origin/main)
-          git clone https://github.com/anyvm-org/base-builder.git
+          git clone https://github.com/${{ github.repository_owner }}/base-builder.git
           python3 base-builder/gendata.py
           . conf/all.release.conf
           echo "ALL_RELEASES=$ALL_RELEASES" >> $GITHUB_ENV
