@@ -32,6 +32,16 @@ jobs:
           token: ${{ secrets.VM_TOKEN }}
 
       - name: Detect and land a new upstream release
+        env:
+          # For hooks whose upstream lives on GitHub (nextbsd, reactos): they
+          # call api.github.com and send this token when it is set. Without
+          # it the call is anonymous, and the anonymous quota is shared by
+          # every job on the runner's IP -- nextbsd's watcher failed with
+          # "HTTP Error 403: rate limit exceeded" on 2026-09-02 and again on
+          # 2026-11-20, each time opening an "upstream watcher" issue for an
+          # upstream that was perfectly fine. watch.py strips only VM_* from
+          # the hook's environment, so this reaches the hook as is.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           git switch main || (git fetch --all && git checkout -b main origin/main)
           git clone https://github.com/${{ github.repository_owner }}/base-builder.git
